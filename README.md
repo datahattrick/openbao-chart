@@ -23,7 +23,8 @@ charts/openbao-platform/   the chart
   values.yaml              base values, heavily commented
   values-dev.yaml          development overlay (reveals keys, keeps root)
   values-openshift.yaml    SCCs, UBI images, Route
-  values-heathernetes.yaml the homelab k3s deployment
+  values-prod.yaml         neutral production skeleton (start here)
+  values-heathernetes.yaml a worked example: the author's homelab k3s cluster
   values-azure.yaml        Azure Key Vault auto-unseal (Workload Identity)
   values-transit.yaml      Transit auto-unseal against another OpenBao
   charts/openbao-0.29.2.tgz  vendored subchart (48 KB)
@@ -33,15 +34,24 @@ scripts/prepare-namespace.sh
 
 ## Quick start
 
+Start from `values-prod.yaml` and replace every `CHANGEME-` value. They are
+non-empty so the chart renders, and obvious so a forgotten one fails at deploy
+rather than silently doing the wrong thing.
+
+`values-heathernetes.yaml` is a *worked example*, not a template — it hardcodes
+one specific cluster's S3 endpoint, log sink, issuer and hostname.
+
 ```sh
-# 1. Namespace with Pod Security labels + a copy of the S3 credentials.
+# 1. Namespace with Pod Security labels (+ any credential Secrets).
 #    Needs cluster-admin.
-KUBECONFIG=~/.kube/config-admin ./scripts/prepare-namespace.sh
+./scripts/prepare-namespace.sh
 
 # 2. Install. The release name is load-bearing — see below.
-KUBECONFIG=~/.kube/config-admin helm upgrade --install openbao \
+#    Layer an auto-unseal overlay, and values-openshift.yaml LAST if applicable:
+#      -f values-prod.yaml -f values-azure.yaml -f values-openshift.yaml
+helm upgrade --install openbao \
   charts/openbao-platform -n openbao \
-  -f charts/openbao-platform/values-heathernetes.yaml
+  -f charts/openbao-platform/values-prod.yaml
 
 # 3. Watch the bootstrap.
 kubectl -n openbao logs -f job/openbao-bootstrap-1 -c bootstrap

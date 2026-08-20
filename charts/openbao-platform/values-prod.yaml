@@ -1,0 +1,307 @@
+# =============================================================================
+# Production skeleton
+# =============================================================================
+# A neutral starting point. Every CHANGEME- value must be replaced; they are
+# deliberately non-empty so the chart renders, and deliberately obvious so a
+# forgotten one fails at deploy rather than silently doing the wrong thing.
+#
+#   helm upgrade --install openbao charts/openbao-platform -n openbao \
+#     -f charts/openbao-platform/values-prod.yaml
+#
+# Layer an auto-unseal overlay on top (strongly recommended — see the note at
+# the bottom), and values-openshift.yaml LAST if you are on OpenShift:
+#
+#     -f values-prod.yaml -f values-azure.yaml -f values-openshift.yaml
+#
+# Read docs/ARCHITECTURE.md before changing the TLS or listener settings.
+# =============================================================================
+
+deployment:
+  environment: production
+
+# OpenBao being evicted takes every dependent workload with it. The subchart
+# reads its own key, so both are set; the render fails if only one is.
+priorityClassName: system-cluster-critical
+
+namespace:
+  # Either let this chart own the namespace (and do NOT pass --create-namespace),
+  # or create it yourself with Pod Security labels. Helm's --create-namespace
+  # makes one with no labels at all.
+  create: false
+
+# -----------------------------------------------------------------------------
+# TLS — two trust domains
+# -----------------------------------------------------------------------------
+tls:
+  enabled: true
+
+  # Namespace-local CA for the BACKEND domain. Deliberately not a ClusterIssuer:
+  # one of those can be referenced from any namespace, so anyone able to create
+  # a Certificate anywhere could mint something a raft join would trust.
+  #
+  # Set create: false and point tls.internal.issuerRef at your own Issuer if you
+  # already run a backend PKI (e.g. an intermediate from an offline root).
+  ca:
+    create: true
+
+  internal:
+    port: 8200
+    # 90d leaf, renewed at 30d. OpenBao picks up the rotation in place via the
+    # cert-reloader sidecar — see openbao.server.tlsReload.
+    duration: 2160h
+    renewBefore: 720h
+
+  server:
+    enabled: true
+    port: 8210
+    # MUST be a different issuer from the backend CA — that separation is the
+    # point. Your corporate CA, an ACME issuer, whatever fronts your estate.
+    issuerRef:
+      name: CHANGEME-public-issuer
+      kind: ClusterIssuer
+      group: cert-manager.io
+    dnsNames:
+      - CHANGEME-openbao.example.com
+
+# -----------------------------------------------------------------------------
+# External access — enable exactly one
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: CHANGEME-nginx
+  host: CHANGEME-openbao.example.com
+  tls:
+    enabled: true
+    secretName: CHANGEME-openbao-ingress-tls
+  traefik:
+    # Traefik only. For nginx use the equivalent backend-protocol/proxy-ssl
+    # annotations under ingress.annotations — the backend speaks TLS on 8210
+    # and the controller MUST be told to re-encrypt, not send plaintext.
+    serversTransport:
+      enabled: false
+  annotations: {}
+    # nginx:
+    #   nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    #   nginx.ingress.kubernetes.io/proxy-ssl-name: "CHANGEME-openbao.example.com"
+    #   nginx.ingress.kubernetes.io/proxy-ssl-secret: "openbao/openbao-tls-server"
+    #   nginx.ingress.kubernetes.io/proxy-ssl-verify: "on"
+
+route:
+  enabled: false        # set by values-openshift.yaml
+
+# -----------------------------------------------------------------------------
+# NetworkPolicy
+# -----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  allowFromNamespaces:
+    - CHANGEME-ingress-nginx
+  monitoring:
+    enabled: true
+    namespace: CHANGEME-monitoring
+  egress:
+    # Off by default because OpenBao needs DNS, the Kubernetes API, S3 and
+    # possibly GitLab. Turn on once you know your endpoints; DNS is included
+    # automatically, omitting it is the classic way to break everything.
+    enabled: false
+    rules: []
+
+monitoring:
+  vmServiceScrape:
+    # VictoriaMetrics Operator. Use openbao.serverTelemetry.prometheusOperator
+    # instead if you run the Prometheus Operator.
+    enabled: false
+
+# -----------------------------------------------------------------------------
+# Audit
+# -----------------------------------------------------------------------------
+# Audit records must never reach stdout. The file device on the PVC is the
+# system of record; the proxy ships a copy and buffers on its behalf.
+auditProxy:
+  enabled: true
+  replicaCount: 2
+  output:
+    type: forward
+    forward:
+      host: CHANGEME-fluent-bit.logging.svc.cluster.local
+      port: 24224
+      tls:
+        enabled: false
+    # The sink's namespace almost certainly has a default-deny ingress policy,
+    # in which case shipping fails silently and records pile up in the buffer.
+    # This opens just the proxy, on just the sink port, in that namespace. Off
+    # by default because writing into someone else's namespace is their call.
+    downstreamNetworkPolicy:
+      enabled: false
+      namespace: CHANGEME-logging
+
+# -----------------------------------------------------------------------------
+# Bootstrap
+# -----------------------------------------------------------------------------
+bootstrap:
+  enabled: true
+
+  init:
+    keyShares: 5
+    keyThreshold: 3
+    # MUST become true when you layer an auto-unseal overlay; the render fails
+    # if a seal is configured and this is not set.
+    autoUnseal: false
+
+  keyOutput:
+    # Left off: while on, anyone who can exec into an OpenBao pod can read the
+    # unseal keys. Extract with `kubectl get secret` instead, store the keys
+    # offline, then delete the Secret.
+    mountIntoServer: false
+
+  # The initial root token is revoked once configuration completes. Requires
+  # openbao.server.generateRootEndpoints.backend so a replacement can be minted
+  # — see docs/RESTORE.md, and note the CLI wrapper is broken on 2.6.x.
+  revokeRootToken: true
+
+  kubernetesAuth:
+    enabled: true
+    path: kubernetes
+    audience: openbao
+
+  snapshot:
+    enabled: true
+    role: bao-snapshot
+
+  gitlab:
+    enabled: false
+    url: CHANGEME-https://gitlab.example.com
+    audience: CHANGEME-https://openbao.example.com
+    policies: {}
+      # opentofu: |
+      #   path "sys/mounts/*"       { capabilities = ["create","read","update","delete","list"] }
+      #   path "sys/policies/acl/*" { capabilities = ["create","read","update","delete","list"] }
+      #   path "auth/*"             { capabilities = ["create","read","update","delete","list"] }
+      #   path "kv/*"               { capabilities = ["create","read","update","delete","list"] }
+    roles: []
+      # bound_claims are the security boundary. Without them ANY pipeline on the
+      # instance can assume the role — the JWT is valid, it is just someone
+      # else's project.
+      # - name: opentofu
+      #   policies: [opentofu]
+      #   userClaim: project_path
+      #   boundClaims:
+      #     project_path: CHANGEME-group/project
+      #     ref: main
+      #     ref_type: branch
+      #     ref_protected: "true"
+
+# -----------------------------------------------------------------------------
+# Raft snapshots
+# -----------------------------------------------------------------------------
+snapshotAgent:
+  enabled: true
+  schedule: "0 2 * * *"
+  timeZone: ""              # IANA name, e.g. Europe/London. Empty = UTC.
+  concurrencyPolicy: Forbid
+  s3:
+    host: CHANGEME-s3.example.com
+    # This becomes s3cmd's --host-bucket. For PATH-style access it must be the
+    # bare host; the `<host>/%(bucket)s` form the docs suggest breaks SigV4 and
+    # surfaces as "403 Invalid signature", which reads like bad credentials.
+    # For VHOST-style use "%(bucket)s.<host>".
+    bucket: CHANGEME-s3.example.com
+    uri: s3://CHANGEME-bucket/openbao/
+    expireDays: "30"
+    extraFlags: ""
+    # Secret with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, in THIS namespace.
+    credentialsSecret: CHANGEME-s3-credentials
+
+# -----------------------------------------------------------------------------
+# Restore — armed manually, never left on. See docs/RESTORE.md.
+# -----------------------------------------------------------------------------
+restore:
+  enabled: false
+
+# =============================================================================
+openbao:
+  server:
+    priorityClassName: system-cluster-critical
+
+    logLevel: info
+    logFormat: json
+
+    # Enables the FRONTEND listener. Must be present whenever
+    # tls.server.enabled is true.
+    extraPorts:
+      - containerPort: 8210
+        name: https-frontend
+        protocol: TCP
+
+    generateRootEndpoints:
+      # Break-glass root generation, in-cluster only. Disabled upstream by
+      # default since v2.5.3; without it, revoking the root token is permanent.
+      backend: true
+      frontend: false
+
+    dataStorage:
+      enabled: true
+      size: 20Gi
+      storageClass: CHANGEME-fast-ssd
+    auditStorage:
+      enabled: true
+      size: 20Gi
+      storageClass: CHANGEME-fast-ssd
+
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 2Gi
+
+    ha:
+      enabled: true
+      # Odd numbers only — an even cluster gives no extra fault tolerance and
+      # doubles the chance of losing quorum. The render enforces this.
+      replicas: 3
+      apiAddr: https://$(BAO_K8S_POD_NAME).openbao-internal.$(BAO_K8S_NAMESPACE).svc:8200
+      disruptionBudget:
+        enabled: true
+        # Upstream's (n/2)-1 is 0 at three nodes and blocks every voluntary
+        # eviction. A 3-voter cluster keeps quorum with one node down.
+        #
+        # Under Shamir an evicted node returns SEALED and needs unsealing by
+        # hand — the PDB protects quorum, not availability. Another reason to
+        # use auto-unseal in production.
+        maxUnavailable: 1
+
+    # The upstream default already requires one replica per node. Spread across
+    # failure domains too if you have them:
+    # topologySpreadConstraints:
+    #   - maxSkew: 1
+    #     topologyKey: topology.kubernetes.io/zone
+    #     whenUnsatisfiable: DoNotSchedule
+    #     labelSelector:
+    #       matchLabels:
+    #         app.kubernetes.io/name: openbao
+    #         component: server
+
+    auditDevices:
+      file:
+        enabled: true
+        filePath: /openbao/audit/audit.log
+      http:
+        # Ships to the audit proxy. Enable together with auditProxy.enabled.
+        #
+        # Note this makes the proxy a dependency of `operator init` only —
+        # measured, not assumed; see docs/AUDIT.md. Everyday startup, unseal
+        # and rescheduling do not touch it.
+        enabled: true
+
+# =============================================================================
+# STRONGLY RECOMMENDED: auto-unseal
+# =============================================================================
+# This skeleton uses Shamir, which means a human must unseal every node after
+# every restart — a node reboot, an eviction, any config change that replaces
+# a pod. That does not scale and it will page someone.
+#
+# Layer values-azure.yaml (Azure Key Vault via Workload Identity) or
+# values-transit.yaml (another OpenBao) and set bootstrap.init.autoUnseal=true.
+# See docs/SEAL.md, and note the built-in cloud seals are removed in v2.7.0.
