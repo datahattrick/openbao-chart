@@ -194,9 +194,16 @@ naming the value to fix.
 {{- end }}
 
 {{/* --- issuer separation ----------------------------------------------------- */}}
-{{- if and .Values.tls.server.enabled .Values.tls.internal.issuerRef.name }}
-  {{- if and (eq .Values.tls.internal.issuerRef.name .Values.tls.server.issuerRef.name) (eq .Values.tls.internal.issuerRef.kind .Values.tls.server.issuerRef.kind) }}
-{{- fail "openbao-platform: the backend and frontend certificates are configured to use the SAME issuer, which defeats the trust separation this chart exists to provide. Point tls.server.issuerRef at a different CA, or set tls.server.enabled=false and accept a single trust domain deliberately." }}
+{{- if .Values.tls.server.enabled }}
+  {{/* Resolve what the BACKEND leaf is actually issued by: either an issuer
+       the operator nominated, or the CA this chart creates. Both have to be
+       compared, or pointing the frontend at the chart-created CA slips through
+       — which is the easiest version of this mistake to make. */}}
+  {{- $beName := .Values.tls.internal.issuerRef.name | default (printf "%s-backend-ca" $fullname) }}
+  {{- $beKind := "Issuer" }}
+  {{- if .Values.tls.internal.issuerRef.name }}{{ $beKind = .Values.tls.internal.issuerRef.kind }}{{ end }}
+  {{- if and (eq $beName .Values.tls.server.issuerRef.name) (eq $beKind .Values.tls.server.issuerRef.kind) }}
+{{- fail (printf "openbao-platform: the frontend certificate is configured to use the SAME issuer as the backend (%s/%s), which defeats the trust separation this chart exists to provide — a certificate from that issuer would be valid for both the ingress and a raft peer. Point tls.server.issuerRef at a different CA, or set tls.server.enabled=false and accept a single trust domain deliberately." $beKind $beName) }}
   {{- end }}
 {{- end }}
 {{- if and .Values.tls.server.enabled (not .Values.tls.server.issuerRef.name) }}
