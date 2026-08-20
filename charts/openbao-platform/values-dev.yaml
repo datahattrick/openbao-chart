@@ -1,0 +1,42 @@
+# Development overlay.
+#
+# Combined with a debug log level this is what unlocks key reveal: the
+# bootstrap Job prints the unseal keys and root token to its log so you can
+# grab them in one step. Both conditions are required, and both are here — do
+# not copy this file into a production values set.
+deployment:
+  environment: development
+
+bootstrap:
+  init:
+    keyShares: 1
+    keyThreshold: 1
+  keyOutput:
+    revealWhenDebug: true
+  # Keep root in development. Consistent with revealing the keys above, and it
+  # saves a generate-root ceremony every time you rebuild a scratch cluster.
+  # Production leaves this at its default of true.
+  revokeRootToken: false
+
+openbao:
+  server:
+    # The second half of the reveal gate.
+    logLevel: debug
+    logFormat: standard
+    ha:
+      replicas: 1
+      raft:
+        enabled: true
+    dataStorage:
+      size: 1Gi
+    auditStorage:
+      size: 1Gi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+    # A single-node cluster cannot satisfy a required pod anti-affinity.
+    affinity: {}

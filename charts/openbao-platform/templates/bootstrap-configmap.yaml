@@ -1,0 +1,611 @@
+{{- if .Values.bootstrap.enabled }}
+{{- $fullname := include "obp.baoFullname" . }}
+{{- $ns := include "obp.namespace" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-bootstrap
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bootstrap
+data:
+  bootstrap.sh: |
+    #!/bin/sh
+    # =========================================================================
+    # OpenBao bootstrap
+    # =========================================================================
+    # Runs exactly once per cluster, from a Job with completions=1 and
+    # parallelism=1 — one Pod, on one node, by construction rather than by
+    # convention. Every step is additionally guarded so that re-running against
+    # an already-initialised cluster reconfigures instead of re-initialising,
+    # which is what makes this safe as a post-upgrade hook.
+    #
+    # Intentionally NOT using `set -x` anywhere: unseal keys and the root token
+    # pass through this script as shell variables.
+    set -eu
+
+    log()  { echo "[bootstrap] $*"; }
+    warn() { echo "[bootstrap] WARNING: $*" >&2; }
+    die()  { echo "[bootstrap] ERROR: $*" >&2; exit 1; }
+
+    WORK="$(mktemp -d)"
+    # The keys live in this directory for the life of the pod. tmpfs-backed
+    # emptyDir, so they never touch a node's disk.
+    cleanup() { rm -rf "$WORK"; }
+    trap cleanup EXIT INT TERM
+
+    export BAO_CACERT="${BAO_CACERT:-}"
+    POD_ADDR() { echo "https://${FULLNAME}-$1.${HEADLESS}.${POD_NAMESPACE}.svc:${BAO_PORT}"; }
+
+    # -- reachability ------------------------------------------------------
+    # `bao status` exit codes: 0 unsealed, 2 sealed, 1 error. An uninitialised
+    # server reports sealed, so 2 is a perfectly good "it is answering".
+    bao_up() {
+      BAO_ADDR="$1" bao status >/dev/null 2>&1 && return 0
+      [ $? -eq 2 ] && return 0
+      return 1
+    }
+
+    bao_field() {
+      # bao_field <addr> <Key Name>
+      BAO_ADDR="$1" bao status 2>/dev/null | awk -v k="$2" '$0 ~ "^"k {print $NF}'
+    }
+
+    wait_for() {
+      addr="$1"; label="$2"; waited=0
+      log "waiting for ${label} at ${addr}"
+      while ! bao_up "$addr"; do
+        waited=$((waited + 5))
+        [ "$waited" -ge "$WAIT_TIMEOUT" ] && die "${label} did not answer within ${WAIT_TIMEOUT}s"
+        sleep 5
+      done
+      log "${label} is answering"
+    }
+
+    # =========================================================================
+    # 0. Pre-flight the audit endpoint
+    # =========================================================================
+    # Audit devices declared in the config file are created during
+    # `operator init`, and a device that fails its test message fails the whole
+    # call -- AFTER the barrier has been created. The result is a cluster that
+    # reports Initialized=true but whose unseal keys were never returned to
+    # anyone, and which therefore cannot ever be unsealed.
+    #
+    # So the endpoint is proven to work here, with the same method, path and
+    # Content-Type OpenBao will use, before init is allowed to run at all.
+    if [ "$AUDIT_HTTP_ENABLED" = "true" ]; then
+      log "pre-flighting the audit endpoint ${AUDIT_HTTP_URL}"
+      waited=0
+      until wget -q -O /dev/null \
+              --header='Content-Type: application/json' \
+              --post-data='{"type":"bootstrap-preflight"}' \
+              "$AUDIT_HTTP_URL" 2>/dev/null; do
+        # Report the actual error the first time round rather than looping in
+        # silence. A hang here is almost always one of: the proxy still
+        # starting, a NetworkPolicy that does not admit this pod, or Fluent Bit
+        # rejecting the Content-Type.
+        if [ "$waited" -eq 0 ]; then
+          warn "first attempt failed; wget says:"
+          wget -O /dev/null \
+            --header='Content-Type: application/json' \
+            --post-data='{"type":"bootstrap-preflight"}' \
+            "$AUDIT_HTTP_URL" 2>&1 | sed 's/^/[bootstrap]   /' || true
+          warn "retrying every 5s for up to ${AUDIT_WAIT_TIMEOUT}s"
+        fi
+        waited=$((waited + 5))
+        if [ "$waited" -ge "$AUDIT_WAIT_TIMEOUT" ]; then
+          die "the audit endpoint ${AUDIT_HTTP_URL} did not accept a test record within ${AUDIT_WAIT_TIMEOUT}s.
+    Refusing to initialise: OpenBao creates config-declared audit devices during
+    'operator init', and if this endpoint rejects the test message the init call
+    fails AFTER the barrier exists, leaving a cluster whose unseal keys were
+    never returned. Fix the audit proxy (or set
+    openbao.server.auditDevices.http.enabled=false) and re-run."
+        fi
+        sleep 5
+      done
+      log "audit endpoint accepted a test record"
+    fi
+
+    # =========================================================================
+    # 1. Initialise
+    # =========================================================================
+    NODE0="$(POD_ADDR 0)"
+    wait_for "$NODE0" "openbao node 0"
+
+    INITIALISED="$(bao_field "$NODE0" Initialized)"
+    log "cluster initialised: ${INITIALISED}"
+
+    if [ "$INITIALISED" = "false" ]; then
+      if [ "$AUTO_UNSEAL" = "true" ]; then
+        # A `seal` stanza is configured, so OpenBao issues RECOVERY keys. They
+        # do not unseal anything; they authorise recovery operations such as
+        # regenerating a root token.
+        log "initialising with ${KEY_SHARES} recovery shares (threshold ${KEY_THRESHOLD})"
+        INIT_OUT="$(BAO_ADDR="$NODE0" bao operator init \
+          -recovery-shares="$KEY_SHARES" -recovery-threshold="$KEY_THRESHOLD" ${INIT_EXTRA_ARGS:-})"
+        KEY_KIND="recovery"
+      else
+        log "initialising with ${KEY_SHARES} unseal shares (threshold ${KEY_THRESHOLD})"
+        INIT_OUT="$(BAO_ADDR="$NODE0" bao operator init \
+          -key-shares="$KEY_SHARES" -key-threshold="$KEY_THRESHOLD" ${INIT_EXTRA_ARGS:-})"
+        KEY_KIND="unseal"
+      fi
+
+      # No jq in the OpenBao image, so parse the table output. $NF rather than a
+      # fixed column so a label change cannot silently shift the value.
+      printf '%s\n' "$INIT_OUT" | awk '/^Unseal Key [0-9]+:/   {print $NF}' >  "$WORK/keys"
+      printf '%s\n' "$INIT_OUT" | awk '/^Recovery Key [0-9]+:/ {print $NF}' >> "$WORK/keys"
+      printf '%s\n' "$INIT_OUT" | awk '/^Initial Root Token:/  {print $NF}'  >  "$WORK/root-token"
+      INIT_OUT=""; unset INIT_OUT
+
+      [ -s "$WORK/keys" ]       || die "could not parse any ${KEY_KIND} keys out of the init output"
+      [ -s "$WORK/root-token" ] || die "could not parse the root token out of the init output"
+      log "initialised; parsed $(wc -l < "$WORK/keys") ${KEY_KIND} key(s)"
+
+      # ---- persist -------------------------------------------------------
+      # Written before any unsealing. If the Job dies between init and this
+      # point the cluster is unrecoverable, so it happens as early as possible.
+      set -- --from-file=root-token="$WORK/root-token" --from-file="${KEY_KIND}-keys=$WORK/keys"
+      i=1
+      while IFS= read -r k; do
+        printf '%s' "$k" > "$WORK/${KEY_KIND}-key-${i}"
+        set -- "$@" --from-file="${KEY_KIND}-key-${i}=$WORK/${KEY_KIND}-key-${i}"
+        i=$((i + 1))
+      done < "$WORK/keys"
+
+      cat > "$WORK/README.txt" <<'READMEEOF'
+    These are the OpenBao initialisation secrets for this cluster.
+
+    THEY ARE NOT BACKED UP ANYWHERE ELSE. A raft snapshot contains the
+    encrypted store, NOT these keys -- a snapshot without them cannot be
+    decrypted and is worthless. Copy them somewhere durable and offline
+    BEFORE you delete this Secret.
+
+      root-token        the initial root token
+      unseal-key-N      shares; any <threshold> of them unseal a node
+      recovery-key-N    present instead of unseal keys under auto-unseal;
+                        these do NOT unseal, they authorise recovery
+
+    To extract and then destroy:
+
+      kubectl -n NAMESPACE get secret SECRETNAME \
+        -o go-template='{{"{{"}}range $k,$v := .data{{"}}"}}{{"{{"}}$k{{"}}"}}: {{"{{"}}$v|base64decode{{"}}"}}
+      {{"{{"}}end{{"}}"}}'
+      kubectl -n NAMESPACE delete secret SECRETNAME
+
+    Deleting the Secret also removes these files from the OpenBao pods, since
+    they are mounted from it.
+    READMEEOF
+      sed -i "s/NAMESPACE/${POD_NAMESPACE}/g; s/SECRETNAME/${SECRET_NAME}/g" "$WORK/README.txt"
+      set -- "$@" --from-file="README.txt=$WORK/README.txt"
+
+      log "writing ${SECRET_NAME}"
+      # --server-side is NOT optional here.
+      #
+      # A client-side `kubectl apply` records the ENTIRE object, data included,
+      # into the kubectl.kubernetes.io/last-applied-configuration annotation.
+      # That would put a second, full copy of the root token and every unseal
+      # key in an annotation -- readable by anyone with `get secret`, and
+      # surviving the deletion of .data.root-token during revocation below, so
+      # the revoked token stays recoverable. Annotations also travel into
+      # `kubectl get -o yaml` dumps, etcd backups and GitOps diffs.
+      #
+      # Server-side apply tracks ownership in managedFields instead and writes
+      # no such annotation.
+      kubectl create secret generic "$SECRET_NAME" "$@" \
+        --dry-run=client -o yaml \
+        | kubectl apply --server-side --force-conflicts \
+            --field-manager=openbao-bootstrap -f - >/dev/null
+      # An earlier version of this chart used client-side apply. If that
+      # annotation is present it holds the keys in clear; remove it.
+      if kubectl get secret "$SECRET_NAME" \
+           -o 'jsonpath={.metadata.annotations.kubectl\.kubernetes\.io/last-applied-configuration}' \
+           2>/dev/null | grep -q .; then
+        warn "found a last-applied-configuration annotation on ${SECRET_NAME}"
+        warn "(written by an older release) -- it contains the keys in clear. Removing."
+        kubectl annotate secret "$SECRET_NAME" \
+          kubectl.kubernetes.io/last-applied-configuration- >/dev/null 2>&1 || true
+      fi
+
+      kubectl label secret "$SECRET_NAME" \
+        app.kubernetes.io/instance="$RELEASE_NAME" \
+        app.kubernetes.io/part-of=openbao-platform --overwrite >/dev/null
+
+      # ---- the reveal gate ------------------------------------------------
+      # Three independent conditions had to hold at render time for REVEAL_KEYS
+      # to be true: environment=development, server log level debug/trace, and
+      # keyOutput.revealWhenDebug. Anything on stdout is collected off the node.
+      if [ "$REVEAL_KEYS" = "true" ]; then
+        echo ""
+        echo "================================================================"
+        echo " DEVELOPMENT MODE -- ${KEY_KIND} keys and root token below."
+        echo " This output goes to the pod log and will be shipped to your log"
+        echo " collector. It is enabled because deployment.environment is"
+        echo " 'development' AND the server log level is debug/trace."
+        echo "================================================================"
+        i=1
+        while IFS= read -r k; do
+          echo "  ${KEY_KIND} key ${i}: ${k}"
+          i=$((i + 1))
+        done < "$WORK/keys"
+        echo "  root token   : $(cat "$WORK/root-token")"
+        echo "  BAO_ADDR     : ${NODE0}"
+        echo "================================================================"
+        echo ""
+      else
+        log "keys stored in Secret ${SECRET_NAME}; not printed (production behaviour)"
+        log "  extract: kubectl -n ${POD_NAMESPACE} get secret ${SECRET_NAME} -o jsonpath='{.data.root-token}' | base64 -d"
+        log "  or read the files mounted on the server pods, then delete the Secret"
+      fi
+    else
+      log "already initialised; reading existing credentials from ${SECRET_NAME}"
+      if ! kubectl get secret "$SECRET_NAME" >/dev/null 2>&1; then
+        warn "Secret ${SECRET_NAME} does not exist and the cluster is already"
+        warn "initialised. That is exactly what you should see once you have"
+        warn "extracted the keys and deleted it."
+        warn "Skipping configuration -- nothing here can run without a token."
+        warn "To reconfigure, set bootstrap.tokenSecret to a Secret holding a"
+        warn "token with sufficient privileges and re-run this Job."
+        [ -n "${BAO_TOKEN_OVERRIDE:-}" ] || exit 0
+      fi
+      if kubectl get secret "$SECRET_NAME" >/dev/null 2>&1; then
+        kubectl get secret "$SECRET_NAME" -o jsonpath='{.data.root-token}' \
+          | base64 -d > "$WORK/root-token" 2>/dev/null || true
+        for kind in unseal recovery; do
+          kubectl get secret "$SECRET_NAME" -o "jsonpath={.data.${kind}-keys}" 2>/dev/null \
+            | base64 -d > "$WORK/keys" 2>/dev/null || true
+          [ -s "$WORK/keys" ] && KEY_KIND="$kind" && break
+        done
+      fi
+      KEY_KIND="${KEY_KIND:-unseal}"
+    fi
+
+    if [ -n "${BAO_TOKEN_OVERRIDE:-}" ]; then
+      log "using the token from bootstrap.tokenSecret instead of the stored root token"
+      printf '%s' "$BAO_TOKEN_OVERRIDE" > "$WORK/root-token"
+    fi
+
+    # =========================================================================
+    # 2. Unseal
+    # =========================================================================
+    # Under auto-unseal the server unseals itself and there is nothing to do.
+    if [ "$AUTO_UNSEAL" != "true" ] && [ "$DO_UNSEAL" = "true" ]; then
+      if [ ! -s "$WORK/keys" ]; then
+        warn "no unseal keys available; skipping unseal"
+      else
+        # Each node is waited for in turn, and that ordering is load-bearing.
+        #
+        # The readiness probe is `bao status`, so a SEALED pod is NOT Ready.
+        # With the StatefulSet's default OrderedReady policy, openbao-N+1 is
+        # not even CREATED until openbao-N is Ready — which only happens once
+        # this loop unseals it. Unsealing node 0 is therefore what causes node
+        # 1 to appear, and so on. A loop that skipped nodes it could not reach
+        # would unseal node 0 and leave the rest of the cluster sealed forever.
+        #
+        # Followers also need node 0 to be leading before retry_join can bring
+        # them up at all, so "not answering yet" is the normal early state, not
+        # an error.
+        n=0
+        while [ "$n" -lt "$REPLICAS" ]; do
+          addr="$(POD_ADDR "$n")"
+          waited=0
+          while ! bao_up "$addr"; do
+            waited=$((waited + 5))
+            if [ "$waited" -ge "$NODE_WAIT_TIMEOUT" ]; then
+              warn "node ${n} never answered within ${NODE_WAIT_TIMEOUT}s."
+              warn "Remaining nodes cannot start until it is Ready. Unseal it by"
+              warn "hand (scripts/unseal.sh) once it is up."
+              break
+            fi
+            [ "$waited" = 5 ] && log "waiting for node ${n} to appear (it starts once node $((n - 1)) is Ready)"
+            sleep 5
+          done
+
+          if bao_up "$addr"; then
+            if [ "$(bao_field "$addr" Sealed)" = "true" ]; then
+              log "unsealing node ${n}"
+              i=1
+              while [ "$i" -le "$KEY_THRESHOLD" ]; do
+                key="$(sed -n "${i}p" "$WORK/keys")"
+                [ -n "$key" ] || die "needed ${KEY_THRESHOLD} keys but only found $((i - 1))"
+                BAO_ADDR="$addr" bao operator unseal "$key" >/dev/null
+                i=$((i + 1))
+              done
+              log "node ${n} unsealed"
+            else
+              log "node ${n} already unsealed"
+            fi
+          fi
+          n=$((n + 1))
+        done
+      fi
+    fi
+
+    # =========================================================================
+    # 3. Configure
+    # =========================================================================
+    wait_for "$NODE0" "openbao node 0 (post-unseal)"
+    [ "$(bao_field "$NODE0" Sealed)" = "false" ] || die "node 0 is still sealed; cannot configure"
+
+    BAO_ADDR="$NODE0"; export BAO_ADDR
+
+    # No usable token is the EXPECTED steady state once revokeRootToken has run
+    # and, separately, once an operator has extracted and deleted the init
+    # Secret. Neither is an error, and neither should fail a `helm upgrade` --
+    # so this exits 0 with an explanation rather than dying.
+    if [ ! -s "$WORK/root-token" ]; then
+      if kubectl get secret "$SECRET_NAME" -o jsonpath='{.data.root-token-revoked}' 2>/dev/null | grep -q .; then
+        log "the root token was revoked by an earlier run. That is the intended"
+        log "end state, so there is nothing to reconfigure and this is not a failure."
+      else
+        warn "no token available, so configuration is being skipped."
+      fi
+      log "To re-run configuration, mint a token and point bootstrap.tokenSecret at it:"
+      log "  see docs/RESTORE.md -- the generate-root CLI is broken on 2.6.x;"
+      log "  use /v1/sys/generate-root on the backend listener with the keys in ${SECRET_NAME}"
+      exit 0
+    fi
+
+    BAO_TOKEN="$(cat "$WORK/root-token")"; export BAO_TOKEN
+
+    has_auth() { bao auth list 2>/dev/null | awk '{print $1}' | grep -qx "$1/"; }
+
+    # -- 3a. audit devices --------------------------------------------------
+    # Nothing to do. Audit devices are declared in the server config file
+    # (openbao.server.auditDevices -> `audit` stanzas in the raft HCL) and are
+    # applied by OpenBao on startup and SIGHUP. Enabling them from here would
+    # fail anyway: a config-declared device cannot be duplicated through the
+    # API. Reported at the end of this script for confirmation.
+
+    # -- 3a-bis. raft autopilot --------------------------------------------
+    if [ "$AUTOPILOT_ENABLED" = "true" ]; then
+      log "configuring raft autopilot"
+      set -- dead_server_last_contact_threshold="$AUTOPILOT_DEAD_THRESHOLD" \
+             server_stabilization_time="$AUTOPILOT_STABILIZATION"
+      # OpenBao rejects cleanup_dead_servers unless min_quorum is also set and
+      # is at least 3 -- which a cluster smaller than that cannot satisfy. So
+      # dead-server cleanup is only offered where it is actually legal.
+      if [ "$REPLICAS" -ge 3 ]; then
+        set -- "$@" cleanup_dead_servers="$AUTOPILOT_CLEANUP" min_quorum="$AUTOPILOT_MIN_QUORUM"
+      else
+        set -- "$@" cleanup_dead_servers=false
+      fi
+      bao write sys/storage/raft/autopilot/configuration "$@" >/dev/null \
+        || warn "could not set autopilot configuration (continuing)"
+    fi
+
+    # -- 3b. policies ------------------------------------------------------
+    # ConfigMap keys cannot contain '/', so policies arrive flattened as
+    # policy-<name>.hcl and the prefix is stripped back off here.
+    for f in /bootstrap/policy-*.hcl; do
+      [ -e "$f" ] || continue
+      name="$(basename "$f" .hcl)"
+      name="${name#policy-}"
+      log "writing policy ${name}"
+      bao policy write "$name" "$f" >/dev/null
+    done
+
+    # -- 3c. JWT/OIDC for Kubernetes service accounts ----------------------
+    if [ "$K8S_AUTH_ENABLED" = "true" ]; then
+      if has_auth "$K8S_AUTH_PATH"; then
+        log "auth mount ${K8S_AUTH_PATH}/ already enabled"
+      else
+        log "enabling jwt auth at ${K8S_AUTH_PATH}/"
+        bao auth enable -path="$K8S_AUTH_PATH" jwt >/dev/null
+      fi
+
+      # Written through stdin as JSON: provider_config is a nested object and
+      # the CLI's key=value form would submit it as a string.
+      log "configuring ${K8S_AUTH_PATH}/ against the cluster's OIDC issuer"
+      if [ "$K8S_AUTH_DISCOVERY" = "jwks" ]; then
+        # Explicit JWKS. Needs the API server to serve the endpoint to this
+        # caller -- see docs/AUTH.md.
+        CA_PEM="$(awk '{printf "%s\\n", $0}' /var/run/secrets/kubernetes.io/serviceaccount/ca.crt)"
+        cat > "$WORK/jwtcfg.json" <<JSONEOF
+    {
+      "jwks_url": "https://kubernetes.default.svc.cluster.local/openid/v1/jwks",
+      "jwks_ca_pem": "${CA_PEM}"
+    }
+    JSONEOF
+      else
+        # In-cluster discovery via the built-in `kubernetes` provider.
+        #
+        # provider_config is a discovery method in its OWN RIGHT, and OpenBao
+        # enforces "exactly one of jwt_validation_pubkeys, jwks_url, jwks_pairs,
+        # oidc_discovery_url or provider_config". Sending oidc_discovery_url
+        # alongside it is rejected twice over -- once by that count, and again
+        # by the provider itself, which errors with "oidc_discovery_url must not
+        # be set when using the kubernetes provider".
+        #
+        # The provider deliberately does NOT accept a URL: it builds one from
+        # KUBERNETES_SERVICE_HOST/PORT and authenticates with the pod's own
+        # service account token and CA. That is what makes this need no extra
+        # RBAC, no anonymous discovery access, and no egress off the cluster.
+        cat > "$WORK/jwtcfg.json" <<JSONEOF
+    {
+      "provider_config": { "provider": "kubernetes" }$(
+        [ -n "${K8S_BOUND_ISSUER:-}" ] && printf ',\n  "bound_issuer": "%s"' "$K8S_BOUND_ISSUER"
+      )
+    }
+    JSONEOF
+      fi
+      sed -i 's/^    //' "$WORK/jwtcfg.json"
+      bao write "auth/${K8S_AUTH_PATH}/config" - < "$WORK/jwtcfg.json" >/dev/null
+      log "configured ${K8S_AUTH_PATH}/"
+
+      # -- the backup service account's identity --------------------------
+      if [ "$SNAPSHOT_ENABLED" = "true" ]; then
+        log "creating jwt role ${SNAPSHOT_ROLE} for ${SNAPSHOT_SUBJECT}"
+        cat > "$WORK/snaprole.json" <<JSONEOF
+    {
+      "role_type": "jwt",
+      "bound_audiences": ["${K8S_AUTH_AUDIENCE}"],
+      "user_claim": "sub",
+      "bound_subject": "${SNAPSHOT_SUBJECT}",
+      "token_policies": ["${SNAPSHOT_POLICY}"],
+      "token_ttl": "${SNAPSHOT_TTL}",
+      "token_max_ttl": "${SNAPSHOT_MAX_TTL}",
+      "token_type": "service",
+      "token_no_default_policy": true
+    }
+    JSONEOF
+        sed -i 's/^    //' "$WORK/snaprole.json"
+        bao write "auth/${K8S_AUTH_PATH}/role/${SNAPSHOT_ROLE}" - < "$WORK/snaprole.json" >/dev/null
+        log "role ${SNAPSHOT_ROLE} bound to audience ${K8S_AUTH_AUDIENCE} and subject ${SNAPSHOT_SUBJECT}"
+      fi
+    fi
+
+    # -- 3d. GitLab CI/CD OIDC ---------------------------------------------
+    if [ "$GITLAB_ENABLED" = "true" ]; then
+      [ -n "$GITLAB_URL" ] || die "bootstrap.gitlab.enabled is true but gitlab.url is empty"
+      if has_auth "$GITLAB_PATH"; then
+        log "auth mount ${GITLAB_PATH}/ already enabled"
+      else
+        log "enabling jwt auth at ${GITLAB_PATH}/ for GitLab CI"
+        bao auth enable -path="$GITLAB_PATH" jwt >/dev/null
+      fi
+      log "configuring ${GITLAB_PATH}/ against ${GITLAB_URL}"
+      if [ -s /bootstrap/gitlab-ca.pem ]; then
+        CA_PEM="$(awk '{printf "%s\\n", $0}' /bootstrap/gitlab-ca.pem)"
+        cat > "$WORK/glcfg.json" <<JSONEOF
+    {
+      "oidc_discovery_url": "${GITLAB_URL}",
+      "bound_issuer": "${GITLAB_ISSUER}",
+      "oidc_discovery_ca_pem": "${CA_PEM}"
+    }
+    JSONEOF
+      else
+        cat > "$WORK/glcfg.json" <<JSONEOF
+    {
+      "oidc_discovery_url": "${GITLAB_URL}",
+      "bound_issuer": "${GITLAB_ISSUER}"
+    }
+    JSONEOF
+      fi
+      sed -i 's/^    //' "$WORK/glcfg.json"
+      bao write "auth/${GITLAB_PATH}/config" - < "$WORK/glcfg.json" >/dev/null
+
+      for f in /bootstrap/gitlab-role-*.json; do
+        [ -e "$f" ] || continue
+        name="$(basename "$f" .json)"
+        name="${name#gitlab-role-}"
+        log "writing gitlab role ${name}"
+        bao write "auth/${GITLAB_PATH}/role/${name}" - < "$f" >/dev/null
+      done
+    fi
+
+    # -- 3e. extras ---------------------------------------------------------
+    if [ -x /bootstrap/extra.sh ] || [ -s /bootstrap/extra.sh ]; then
+      log "running extraCommands"
+      # shellcheck disable=SC1091
+      . /bootstrap/extra.sh
+    fi
+
+    # =========================================================================
+    # 4. Report
+    # =========================================================================
+    log "raft peers:"
+    bao operator raft list-peers 2>/dev/null | sed 's/^/[bootstrap]   /' || \
+      warn "could not list raft peers (node 0 may not be the leader yet)"
+    log "audit devices:"
+    bao audit list 2>/dev/null | sed 's/^/[bootstrap]   /' || true
+    log "auth mounts:"
+    bao auth list 2>/dev/null | sed 's/^/[bootstrap]   /' || true
+
+    # =========================================================================
+    # 5. Give up root
+    # =========================================================================
+    # Deliberately last, after the report above -- everything before this point
+    # needs the token.
+    #
+    # Once the auth mounts, policies and roles exist, nothing requires root. A
+    # root token never expires, so leaving one behind means a permanent
+    # break-glass credential sitting in a Secret and in whatever the operator
+    # pasted it into. Revoking it costs nothing: a new one can be regenerated
+    # from the unseal keys at any time via /v1/sys/generate-root (see
+    # docs/RESTORE.md -- the CLI wrapper is broken on 2.6.x, and the endpoint
+    # must be enabled, which openbao.server.generateRootEndpoints.backend does).
+    if [ "$REVOKE_ROOT" = "true" ]; then
+      if [ -n "${BAO_TOKEN_OVERRIDE:-}" ]; then
+        log "not revoking: the token came from bootstrap.tokenSecret and is not ours to revoke"
+      else
+        log "revoking the initial root token"
+        if bao token revoke -self >/dev/null 2>&1; then
+          log "root token revoked"
+          # The stored copy is now dead. Remove it rather than leave something
+          # that looks like a working credential, and say how to get a new one.
+          if kubectl get secret "$SECRET_NAME" >/dev/null 2>&1; then
+            MARKER="$(printf 'Revoked by the bootstrap job at %s.\nThe unseal keys in this Secret still work. To mint a new root token see\ndocs/RESTORE.md. NOTE: `bao operator generate-root` does NOT work on 2.6.x --\nthe CLI calls a legacy path that returns 403. Use the API at\n/v1/sys/generate-root/{attempt,update} on the backend listener.\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | base64 | tr -d '\n')"
+            kubectl patch secret "$SECRET_NAME" --type=merge \
+              -p "{\"data\":{\"root-token\":null,\"root-token-revoked\":\"${MARKER}\"}}" >/dev/null
+            log "removed root-token from ${SECRET_NAME}; the ${KEY_KIND} keys are retained"
+          fi
+        else
+          warn "could not revoke the root token -- it is STILL VALID in ${SECRET_NAME}."
+          warn "Revoke it by hand: bao token revoke <token>"
+        fi
+      fi
+    else
+      warn "bootstrap.revokeRootToken is false: a non-expiring root token remains"
+      warn "in Secret ${SECRET_NAME}. Revoke it once you no longer need it."
+    fi
+
+    log "bootstrap complete"
+{{- if and .Values.bootstrap.kubernetesAuth.enabled .Values.bootstrap.snapshot.enabled }}
+
+  # The backup service account's entire authority. `read` on the snapshot
+  # endpoint is genuinely all the agent needs: it streams the snapshot and
+  # uploads it. Note token_no_default_policy on the role — without it the
+  # identity would also carry `default`, which grants token self-management and
+  # a handful of sys endpoints it has no use for.
+  policy-{{ .Values.bootstrap.snapshot.policyName }}.hcl: |
+    path "sys/storage/raft/snapshot" {
+      capabilities = ["read"]
+    }
+{{- end }}
+{{- range $name, $hcl := .Values.bootstrap.gitlab.policies }}
+
+  policy-{{ $name }}.hcl: |
+    {{- tpl $hcl $ | nindent 4 }}
+{{- end }}
+{{- range $name, $hcl := .Values.bootstrap.policies }}
+
+  policy-{{ $name }}.hcl: |
+    {{- tpl $hcl $ | nindent 4 }}
+{{- end }}
+{{- if .Values.bootstrap.gitlab.enabled }}
+{{- $gl := .Values.bootstrap.gitlab }}
+{{- $aud := $gl.audience | default $gl.url }}
+{{- range $gl.roles }}
+
+  # bound_claims are the security boundary here. Without them ANY pipeline on
+  # the GitLab instance could assume this role — the JWT is valid, it is just
+  # from a different project.
+  gitlab-role-{{ .name }}.json: |
+    {{- $role := dict
+          "role_type" "jwt"
+          "bound_audiences" (list ($aud))
+          "user_claim" (.userClaim | default "project_path")
+          "bound_claims" (.boundClaims | default dict)
+          "token_policies" (.policies | default list)
+          "token_ttl" (.tokenTtl | default "30m")
+          "token_max_ttl" (.tokenMaxTtl | default "1h")
+          "token_type" "service"
+          "token_no_default_policy" true }}
+    {{- if .boundClaimsType }}{{ $_ := set $role "bound_claims_type" .boundClaimsType }}{{ end }}
+    {{- if .groupsClaim }}{{ $_ := set $role "groups_claim" .groupsClaim }}{{ end }}
+    {{- toPrettyJson $role | nindent 4 }}
+{{- end }}
+{{- if $gl.caPem }}
+
+  gitlab-ca.pem: |
+    {{- $gl.caPem | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- with .Values.bootstrap.extraCommands }}
+
+  extra.sh: |
+    {{- tpl . $ | nindent 4 }}
+{{- end }}
+{{- end }}

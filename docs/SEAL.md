@@ -1,0 +1,203 @@
+# Auto-unseal
+
+Two environments, two mechanisms — and only one of them needs a plugin.
+
+| Environment | Seal | Plugin needed? | Overlay |
+|---|---|---|---|
+| Azure | `azurekeyvault` | **yes**, from v2.7.0 | `values-azure.yaml` |
+| Other | `transit` (another OpenBao) | no — stays built-in | `values-transit.yaml` |
+
+## What changes in v2.7.0
+
+The built-in `alicloudkms`, `awskms`, **`azurekeyvault`**, `gcpckms`, `ocikms`
+and `pkcs11` seals are **removed from the OpenBao binary in v2.7.0** and remain
+available as external plugins only. `transit` is **not** on that list.
+
+A plugin **shadows a built-in of the same name and takes priority**. So register
+the plugin now, while still on 2.6.x, and the 2.7.0 upgrade becomes a no-op
+instead of a flag day. That is the migration path this chart takes.
+
+```mermaid
+flowchart LR
+    subgraph now["OpenBao 2.6.x — today"]
+        b1["built-in azurekeyvault"]
+        p1["plugin azurekeyvault"]
+        p1 -->|shadows, takes priority| b1
+    end
+    subgraph then["OpenBao 2.7.0"]
+        b2["built-in: REMOVED"]
+        p2["plugin azurekeyvault"]
+    end
+    now -->|"upgrade — nothing to change"| then
+    style b2 fill:#fee,stroke:#c44
+    style p1 fill:#efe,stroke:#4a4
+    style p2 fill:#efe,stroke:#4a4
+```
+
+## Getting the plugin into the pod
+
+Two delivery paths, both airgap-capable. `seal.plugin.source` picks one.
+
+```mermaid
+flowchart TB
+    art[("Artifactory")]
+
+    subgraph oci["source: oci  — fewest moving parts"]
+        direction TB
+        o1["OpenBao pulls the OCI image itself"] --> o2["extracts binary"] --> o3["verifies sha256sum"]
+    end
+
+    subgraph pre["source: preloaded — for a generic repo"]
+        direction TB
+        p1["initContainer: curl tarball"] --> p2["sha256sum -c<br/><i>refuses to install on mismatch</i>"] --> p3["install -m 0755 into<br/>plugin_directory (emptyDir)"]
+    end
+
+    art -->|"Docker repo"| oci
+    art -->|"generic repo"| pre
+    oci --> pd[("plugin_directory<br/>/openbao/plugins")]
+    pre --> pd
+    pd --> bao["OpenBao verifies sha256sum again,<br/>then loads the seal"]
+
+    style oci fill:#eef,stroke:#88a
+    style pre fill:#efe,stroke:#4a4
+```
+
+**`sha256sum` is mandatory either way** — OpenBao verifies the binary against it
+on load. That is precisely what makes pulling from a mirror or Artifactory safe,
+and why the chart refuses to render without it.
+
+Use `preloaded` when Artifactory serves the release tarball from a *generic*
+repo rather than as an OCI image, or when the OpenBao pod itself is not allowed
+egress to a registry. Use `oci` otherwise.
+
+### The two binary names
+
+Same binary, same bytes, same checksum — packaged under different names:
+
+| Source | Name |
+|---|---|
+| OCI image `ghcr.io/openbao/openbao-plugin-kms-azure:v0.1.0` | `openbao-plugin-kms-azure` |
+| Release tarball `openbao-plugin-kms-azure_linux_amd64_v1.tar.gz` | `openbao-plugin-kms-azure_linux_amd64_v1` |
+
+The published `checksums-kms-azure.txt` line refers to the **tarball** name.
+Verified by extracting both and comparing hashes — identical
+(`e46a6d13…`). The chart models this as two values: `binaryName` (OCI /
+installed name) and `archiveBinary` (inside the tarball, used for the checksum
+check). Mixing them up surfaces as "plugin not found" or a checksum mismatch,
+neither of which points at the naming.
+
+Mirror both if you want both paths available:
+
+```sh
+skopeo copy --all \
+  docker://ghcr.io/openbao/openbao-plugin-kms-azure:v0.1.0 \
+  docker://artifactory.example.com/openbao/openbao-plugin-kms-azure:v0.1.0
+
+curl -fLO https://github.com/openbao/openbao-plugins/releases/download/\
+kms-azure-v0.1.0/openbao-plugin-kms-azure_linux_amd64_v1.tar.gz
+```
+
+## Azure Key Vault with Workload Identity
+
+Federated OIDC — no client secret anywhere in the cluster.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as azure-workload-identity webhook
+    participant P as openbao pod
+    participant E as Entra ID
+    participant KV as Key Vault
+
+    Note over P: pod label azure.workload.identity/use: "true"
+    W->>P: inject AZURE_CLIENT_ID, AZURE_TENANT_ID,<br/>AZURE_FEDERATED_TOKEN_FILE, AZURE_AUTHORITY_HOST<br/>+ projected token (aud: api://AzureADTokenExchange)
+    P->>E: exchange federated token<br/>(auth_method = "workload_identity")
+    E->>E: match federated credential<br/>issuer = AKS OIDC issuer<br/>subject = system:serviceaccount:ns:sa
+    E-->>P: access token
+    P->>KV: unwrapKey(unseal key)
+    KV-->>P: unwrapped key → OpenBao unseals
+```
+
+`auth_method = "workload_identity"` selects `WorkloadIdentityCredential`
+explicitly. `default` would also find it, but only after walking a credential
+chain, and it fails less clearly when misconfigured.
+
+Leave `tenantId` and `clientId` **empty** — the webhook injects them, and values
+in the config file take precedence over what it injected.
+
+### Prerequisites outside this chart
+
+1. Key Vault + key, with the managed identity granted **Key Vault Crypto User**
+   (`wrapKey`, `unwrapKey`, `get`).
+2. A **federated credential** on that identity:
+   `issuer` = the AKS cluster's OIDC issuer URL,
+   `subject` = `system:serviceaccount:<namespace>:<serviceaccount>`,
+   `audience` = `api://AzureADTokenExchange`.
+3. The **azure-workload-identity webhook** installed. It only mutates pods
+   carrying the `azure.workload.identity/use: "true"` label — the chart fails
+   the render if that label or the SA's `client-id` annotation is missing,
+   because otherwise the seal fails at startup with an opaque credential error.
+
+## Transit
+
+No plugin needed. The token comes from a Secret via
+`extraSecretEnvironmentVars`, never from the config file — that is a ConfigMap.
+
+On the unsealer:
+
+```sh
+bao secrets enable transit
+bao write -f transit/keys/openbao-unseal
+bao policy write openbao-unseal - <<'POLICY'
+path "transit/encrypt/openbao-unseal" { capabilities = ["update"] }
+path "transit/decrypt/openbao-unseal" { capabilities = ["update"] }
+POLICY
+```
+
+> **Circularity warning.** The unsealer must not depend on this cluster for
+> anything, or a simultaneous restart deadlocks both. Keep it in a separate
+> failure domain, and keep it Shamir- or KMS-sealed itself.
+
+Its CA is its own trust domain — mount it separately, do **not** reuse this
+cluster's backend CA.
+
+## What auto-unseal changes about bootstrap
+
+`bootstrap.init.autoUnseal: true` is **mandatory** with any seal, and the chart
+fails the render if the two disagree in either direction.
+
+```mermaid
+flowchart LR
+    subgraph shamir["Shamir (no seal)"]
+        s1["operator init<br/>-key-shares/-key-threshold"] --> s2["UNSEAL keys"] --> s3["Job unseals every replica"]
+    end
+    subgraph auto["auto-unseal (seal configured)"]
+        a1["operator init<br/>-recovery-shares/-recovery-threshold"] --> a2["RECOVERY keys"] --> a3["cluster unseals itself<br/><i>Job skips unsealing</i>"]
+    end
+    style shamir fill:#eef,stroke:#88a
+    style auto fill:#efe,stroke:#4a4
+```
+
+**Recovery keys do not unseal anything.** They authorise recovery operations —
+root generation, `rekey`. Note those endpoints are disabled by default since
+v2.5.3; see [RESTORE.md](RESTORE.md#minting-a-root-token-break-glass). Store them as carefully as unseal keys, and note the
+harder truth: with auto-unseal, **losing the KMS key is unrecoverable no matter
+what you kept**. Back up the Key Vault key, and see
+[RESTORE.md](RESTORE.md) — a snapshot is still worthless without the means to
+decrypt it.
+
+## Verification status
+
+Rendered and validated, **not deployed** — the homelab cluster has neither Azure
+nor a second OpenBao. What was checked directly:
+
+- both overlays render; the `seal`, `plugin`, `plugin_directory` stanzas emit
+  correctly, and `plugin_directory` is omitted when no plugin is registered
+- the plugin OCI image and release tarball were both fetched and their binaries
+  hashed — identical bytes, and the published checksum matches
+- the fetch script's download → `sha256sum -c` → `install` logic was executed
+  against the real artifact; a tampered binary is correctly refused
+- 10 negative tests against the validation rules, all caught
+
+Not verified without Azure: the federated token exchange and an actual
+wrap/unwrap against Key Vault.

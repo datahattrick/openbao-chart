@@ -1,0 +1,64 @@
+# Environment: non-Azure — auto-unseal against another OpenBao's transit engine.
+#
+#   helm upgrade --install openbao charts/openbao-platform -n openbao \
+#     -f charts/openbao-platform/values-prod.yaml \
+#     -f charts/openbao-platform/values-transit.yaml
+#
+# `transit` is NOT one of the seals removed in v2.7.0, so no plugin is needed
+# here. That asymmetry is the reason the two environments are configured
+# differently rather than uniformly.
+#
+# PREREQUISITES on the OTHER (unsealer) OpenBao:
+#   bao secrets enable transit
+#   bao write -f transit/keys/openbao-unseal
+#   bao policy write openbao-unseal - <<'EOF'
+#     path "transit/encrypt/openbao-unseal" { capabilities = ["update"] }
+#     path "transit/decrypt/openbao-unseal" { capabilities = ["update"] }
+#   EOF
+#
+# CIRCULARITY WARNING: the unsealer must not depend on this cluster for
+# anything, or a simultaneous restart deadlocks both. Keep it in a separate
+# failure domain, and keep it Shamir-sealed or KMS-sealed itself.
+
+bootstrap:
+  init:
+    autoUnseal: true
+    keyShares: 5
+    keyThreshold: 3
+
+openbao:
+  server:
+    seal:
+      type: transit
+      transit:
+        address: CHANGEME-https://openbao.other-cluster.example.com:8200
+        keyName: openbao-unseal
+        mountPath: transit/
+        # The remote cluster's own trust domain — deliberately NOT this
+        # cluster's backend CA.
+        tlsCaCert: /openbao/tls/transit/ca.crt
+        # tlsServerName: openbao.other-cluster.example.com
+      plugin:
+        enabled: false        # transit stays built-in
+
+    # The seal's token. Never in the config file — that is a ConfigMap.
+    extraSecretEnvironmentVars:
+      - envName: BAO_TOKEN
+        secretName: openbao-transit-unseal
+        secretKey: token
+
+    volumes:
+      - name: tls-internal
+        secret: { secretName: openbao-tls-internal, defaultMode: 0400 }
+      - name: tls-server
+        secret: { secretName: openbao-tls-server, defaultMode: 0400 }
+      # init-keys is deliberately NOT mounted: bootstrap.keyOutput.mountIntoServer
+      # defaults to false so the keys are not readable by anyone who can exec
+      # into a pod. Add it back together with that flag if you want the
+      # extract-from-the-pod flow.
+      - name: tls-transit
+        secret: { secretName: openbao-transit-ca, defaultMode: 0400 }
+    volumeMounts:
+      - { name: tls-internal, mountPath: /openbao/tls/internal, readOnly: true }
+      - { name: tls-server,   mountPath: /openbao/tls/server,   readOnly: true }
+      - { name: tls-transit,  mountPath: /openbao/tls/transit,  readOnly: true }

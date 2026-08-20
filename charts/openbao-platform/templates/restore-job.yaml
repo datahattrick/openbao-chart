@@ -1,0 +1,286 @@
+{{- if .Values.restore.enabled }}
+{{- $r := .Values.restore }}
+{{- $fullname := include "obp.baoFullname" . }}
+{{- $ns := include "obp.namespace" . }}
+{{- $bao := index .Values "openbao" }}
+{{- $snap := $bao.snapshotAgent | default dict }}
+{{- $sc := $snap.config | default dict }}
+
+{{- /* ---------------------------------------------------------------- */}}
+{{- /* Safety interlock. Two independent values must agree before this   */}}
+{{- /* Job exists at all, so neither a stale `enabled: true` nor a       */}}
+{{- /* GitOps replay can overwrite a live cluster's storage on its own.  */}}
+{{- /* ---------------------------------------------------------------- */}}
+{{- if not $r.snapshot }}
+{{- fail "openbao-platform: restore.enabled is true but restore.snapshot is empty. Name the object to restore (or \"latest\")." }}
+{{- end }}
+{{- if ne $r.confirm $r.snapshot }}
+{{- fail (printf "openbao-platform: restore is armed but not confirmed. This Job OVERWRITES the entire OpenBao store. To proceed, set restore.confirm to exactly the same value as restore.snapshot (%q). Read docs/RESTORE.md first — restoring a snapshot taken under a different master key also requires the ORIGINAL unseal keys." $r.snapshot) }}
+{{- end }}
+{{- if not (has $r.mode (list "same-cluster" "new-cluster")) }}
+{{- fail "openbao-platform: restore.mode must be \"same-cluster\" or \"new-cluster\"." }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-restore
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: restore
+data:
+  restore.sh: |
+    #!/bin/sh
+    set -eu
+    log() { echo "[restore] $*"; }
+    die() { echo "[restore] ERROR: $*" >&2; exit 1; }
+
+    WORK="$(mktemp -d)"
+    trap 'rm -rf "$WORK"' EXIT INT TERM
+    SNAP="$WORK/restore.snapshot"
+
+    # -- 1. fetch ---------------------------------------------------------
+    case "$SOURCE_TYPE" in
+      s3)
+        if [ "$SNAPSHOT_NAME" = "latest" ]; then
+          log "resolving the most recent object under ${S3_URI}"
+          SNAPSHOT_NAME="$(s3cmd ls "${S3_URI%/}/" --host="$S3_HOST" \
+            --host-bucket="$S3_BUCKET" ${S3_EXTRA_FLAGS:-} \
+            | sort -k1,2 | tail -1 | awk '{print $NF}')"
+          [ -n "$SNAPSHOT_NAME" ] || die "no objects found under ${S3_URI}"
+          log "latest resolves to ${SNAPSHOT_NAME}"
+          OBJ="$SNAPSHOT_NAME"
+        else
+          OBJ="${S3_URI%/}/${SNAPSHOT_NAME}"
+        fi
+        log "downloading ${OBJ}"
+        s3cmd get "$OBJ" "$SNAP" --host="$S3_HOST" --host-bucket="$S3_BUCKET" \
+          ${S3_EXTRA_FLAGS:-} --force >/dev/null
+        ;;
+      pvc)
+        log "copying ${PVC_PATH}/${SNAPSHOT_NAME}"
+        cp "${PVC_PATH}/${SNAPSHOT_NAME}" "$SNAP"
+        ;;
+      url)
+        log "downloading ${SOURCE_URL}"
+        wget -q -O "$SNAP" "$SOURCE_URL"
+        ;;
+      *) die "unknown restore.source.type: ${SOURCE_TYPE}" ;;
+    esac
+
+    [ -s "$SNAP" ] || die "snapshot is empty"
+    SIZE="$(wc -c < "$SNAP")"
+    log "fetched ${SIZE} bytes"
+
+    # A raft snapshot is a gzipped tar containing SHA256SUMS, meta.json and
+    # state.bin. Checking that here turns "restored a truncated download" into
+    # a clean failure before anything is overwritten.
+    if ! gzip -t "$SNAP" 2>/dev/null; then
+      die "not a valid gzip stream -- the download is truncated or this is not a snapshot"
+    fi
+    if ! tar tzf "$SNAP" 2>/dev/null | grep -q 'state.bin'; then
+      die "no state.bin inside -- this is not an OpenBao raft snapshot"
+    fi
+    log "snapshot structure looks valid:"
+    tar tzf "$SNAP" 2>/dev/null | sed 's/^/[restore]   /'
+
+    if [ "$DRY_RUN" = "true" ]; then
+      log "dryRun is set -- fetched and validated, writing nothing. Stopping here."
+      exit 0
+    fi
+
+    # -- 2. restore -------------------------------------------------------
+    log "target: ${BAO_ADDR}"
+    bao status >/dev/null 2>&1 || [ $? -eq 2 ] || die "target is not answering"
+    [ "$(bao status 2>/dev/null | awk '/^Sealed/ {print $NF}')" = "false" ] \
+      || die "target is sealed. A restore is an authenticated API call, so the cluster must be initialised and unsealed FIRST -- even when the point is to replace its contents."
+
+    echo ""
+    echo "================================================================"
+    echo " RESTORING ${SNAPSHOT_NAME}"
+    echo " mode   : ${MODE}"
+    echo " target : ${BAO_ADDR}"
+    echo " This REPLACES the entire OpenBao store."
+    echo "================================================================"
+    echo ""
+
+    if [ "$MODE" = "new-cluster" ]; then
+      # -force skips the check that the snapshot's seal config matches this
+      # cluster's. Required when rebuilding, because the fresh cluster was
+      # initialised with its own throwaway keys.
+      log "restoring with -force (new-cluster)"
+      bao operator raft snapshot restore -force "$SNAP"
+      echo ""
+      echo "================================================================"
+      echo " RESTORE WRITTEN -- THE CLUSTER IS NOT USABLE YET."
+      echo ""
+      echo " The store now holds data encrypted under the ORIGINAL cluster's"
+      echo " master key. The keys from this cluster's init are dead."
+      echo ""
+      echo " Next, by hand:"
+      echo "   1. The nodes will seal themselves. Unseal EVERY node with the"
+      echo "      ORIGINAL unseal keys, not the ones this cluster was built"
+      echo "      with."
+      echo "   2. Authenticate with the ORIGINAL root token."
+      echo "   3. bao operator raft list-peers -- expect stale peers from the"
+      echo "      old cluster; remove them with remove-peer."
+      echo "================================================================"
+    else
+      log "restoring in place (same-cluster)"
+      bao operator raft snapshot restore "$SNAP"
+      log "restore complete. The cluster stays unsealed; existing unseal keys and tokens are unchanged."
+    fi
+
+    log "raft peers:"
+    bao operator raft list-peers 2>/dev/null | sed 's/^/[restore]   /' || true
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-restore-%d" $fullname .Release.Revision | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: restore
+  {{- with $r.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  completions: 1
+  parallelism: 1
+  # Zero: a partially applied restore must not be retried automatically.
+  backoffLimit: {{ $r.backoffLimit }}
+  activeDeadlineSeconds: {{ $r.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "obp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: restore
+      {{- with $r.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      restartPolicy: Never
+      {{- include "obp.priorityClassName" (dict "root" $ "component" $r) | nindent 6 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with $r.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $r.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: restore
+          image: "{{ $r.image.registry }}/{{ $r.image.repository }}:{{ $r.image.tag }}"
+          imagePullPolicy: {{ $r.image.pullPolicy }}
+          command: ["/bin/sh", "/restore/restore.sh"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml $r.resources | nindent 12 }}
+          env:
+            - name: HOME
+              value: /tmp
+            - name: BAO_ADDR
+              value: {{ include "obp.baoInternalAddr" . | quote }}
+            {{- if .Values.tls.enabled }}
+            - name: BAO_CACERT
+              value: {{ include "obp.internalCaPath" . | quote }}
+            {{- end }}
+            - name: BAO_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  {{- if $r.tokenSecret.name }}
+                  name: {{ $r.tokenSecret.name }}
+                  key: {{ $r.tokenSecret.key }}
+                  {{- else }}
+                  name: {{ include "obp.initKeysSecret" . }}
+                  key: root-token
+                  {{- end }}
+            - name: SNAPSHOT_NAME
+              value: {{ $r.snapshot | quote }}
+            - name: MODE
+              value: {{ $r.mode | quote }}
+            - name: DRY_RUN
+              value: {{ $r.dryRun | quote }}
+            - name: SOURCE_TYPE
+              value: {{ $r.source.type | quote }}
+            - name: S3_URI
+              value: {{ $r.source.s3.uri | default ($sc.s3Uri | default "") | quote }}
+            - name: S3_HOST
+              value: {{ $r.source.s3.host | default ($sc.s3Host | default "") | quote }}
+            - name: S3_BUCKET
+              value: {{ $r.source.s3.bucket | default ($sc.s3Bucket | default "") | quote }}
+            - name: S3_EXTRA_FLAGS
+              value: {{ $r.source.s3.extraFlags | default ($sc.s3cmdExtraFlag | default "") | quote }}
+            - name: PVC_PATH
+              value: {{ $r.source.pvc.path | quote }}
+            - name: SOURCE_URL
+              value: {{ $r.source.url | quote }}
+            {{- $credSecret := $r.source.s3.credentialsSecret | default ($snap.s3CredentialsSecret | default "") }}
+            {{- if and (eq $r.source.type "s3") $credSecret }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $credSecret }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $credSecret }}
+                  key: AWS_SECRET_ACCESS_KEY
+            {{- end }}
+          volumeMounts:
+            - name: restore
+              mountPath: /restore
+              readOnly: true
+            {{- if .Values.tls.enabled }}
+            - name: tls-internal
+              mountPath: {{ .Values.tls.internal.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if eq $r.source.type "pvc" }}
+            - name: source
+              mountPath: {{ $r.source.pvc.path }}
+              readOnly: true
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: restore
+          configMap:
+            name: {{ $fullname }}-restore
+            defaultMode: 0555
+        {{- if .Values.tls.enabled }}
+        - name: tls-internal
+          secret:
+            secretName: {{ include "obp.internalTlsSecret" . }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if eq $r.source.type "pvc" }}
+        - name: source
+          persistentVolumeClaim:
+            claimName: {{ $r.source.pvc.claimName }}
+        {{- end }}
+        - name: tmp
+          # The snapshot is written here, so it must be large enough to hold it.
+          emptyDir:
+            sizeLimit: 8Gi
+      {{- with ($bao.global).imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

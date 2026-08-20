@@ -1,0 +1,104 @@
+{{- $fullname := include "obp.baoFullname" . }}
+{{- $ns := include "obp.namespace" . }}
+{{- $bao := index .Values "openbao" }}
+{{- $snap := $bao.snapshotAgent | default dict }}
+
+  openbao-platform {{ .Chart.Version }}  (OpenBao {{ .Chart.AppVersion }}, subchart openbao 0.29.2)
+  release {{ .Release.Name }} in namespace {{ $ns }}
+
+TRUST DOMAINS
+{{ if .Values.tls.enabled }}
+  backend  :{{ .Values.tls.internal.port }}  {{ if .Values.tls.ca.create }}CA created by this chart (Issuer/{{ $fullname }}-backend-ca){{ else }}{{ .Values.tls.internal.issuerRef.kind }}/{{ .Values.tls.internal.issuerRef.name }}{{ end }}
+             raft join, request forwarding, probes, snapshot agent, metrics
+{{- if .Values.tls.server.enabled }}
+  frontend :{{ .Values.tls.server.port }}  {{ .Values.tls.server.issuerRef.kind }}/{{ .Values.tls.server.issuerRef.name }}
+             ingress traffic only; never validated by a raft peer
+{{- else }}
+  frontend  DISABLED - single trust domain.
+{{- end }}
+{{- else }}
+  TLS IS DISABLED. Do not run this way outside a scratch cluster.
+{{- end }}
+
+NEXT STEPS
+{{ if .Values.bootstrap.enabled }}
+  1. Watch the bootstrap Job. It initialises, unseals and configures the
+     cluster, and it is the only thing that runs on exactly one node.
+
+       kubectl -n {{ $ns }} logs -f job/{{ printf "%s-bootstrap-%d" $fullname .Release.Revision | trunc 63 | trimSuffix "-" }}
+{{ if eq (include "obp.revealKeys" .) "true" }}
+  !! KEY REVEAL IS ON. deployment.environment=development and the server log
+  !! level is {{ include "obp.logLevel" . }}, so the unseal keys and root token WILL be
+  !! printed to that log and shipped to your log collector.
+  !! This must never be the case in production.
+{{- else }}
+  2. Take the keys off the cluster, then destroy them. A raft snapshot does
+     NOT contain them; a snapshot without these keys cannot be decrypted.
+
+{{- if .Values.bootstrap.keyOutput.mountIntoServer }}
+       kubectl -n {{ $ns }} exec {{ $fullname }}-0 -- cat {{ .Values.bootstrap.keyOutput.mountPath }}/README.txt
+       kubectl -n {{ $ns }} exec {{ $fullname }}-0 -- cat {{ .Values.bootstrap.keyOutput.mountPath }}/root-token
+{{- end }}
+       kubectl -n {{ $ns }} get secret {{ include "obp.initKeysSecret" . }} -o yaml   # back this up offline
+
+     Then, once they are safely stored elsewhere:
+
+       kubectl -n {{ $ns }} delete secret {{ include "obp.initKeysSecret" . }}
+{{- end }}
+{{- else }}
+  Bootstrap is disabled - initialise and unseal by hand.
+{{- end }}
+
+ACCESS
+{{ if .Values.ingress.enabled }}
+       https://{{ .Values.ingress.host }}
+{{- else if .Values.route.enabled }}
+       https://{{ .Values.route.host | default "<route host>" }}
+{{- else }}
+       kubectl -n {{ $ns }} port-forward svc/{{ $fullname }} {{ .Values.tls.internal.port }}:{{ .Values.tls.internal.port }}
+       export BAO_ADDR=https://127.0.0.1:{{ .Values.tls.internal.port }}
+{{- end }}
+
+BACKUPS
+{{ if $snap.enabled }}
+  Snapshot CronJob: {{ ($snap.schedule) }} -> {{ ($snap.config).s3Uri }}
+  Auth: jwt role {{ .Values.bootstrap.snapshot.role }} on auth/{{ .Values.bootstrap.kubernetesAuth.path }}/,
+  bound to audience "{{ .Values.bootstrap.kubernetesAuth.audience }}".
+
+       kubectl -n {{ $ns }} create job --from=cronjob/{{ $fullname }}-snapshot snap-test
+
+  Restoring is NOT automatic. Read docs/RESTORE.md before you need it.
+{{- else }}
+  !! NO BACKUPS. openbao.snapshotAgent.enabled is false, so nothing is taking
+  !! raft snapshots. Set it, along with S3 settings, before this holds anything
+  !! you care about.
+{{- end }}
+
+AUDIT   (declared in the config file; applied on startup and SIGHUP)
+{{- $ad := (($bao.server).auditDevices) | default dict }}
+{{ if ($ad.file).enabled }}
+  file -> {{ $ad.file.filePath }} (PVC; system of record)
+{{- else }}
+  !! No file audit device. If a shipping device is the only one and it fails,
+  !! OpenBao stops serving requests.
+{{- end }}
+{{- if ($ad.http).enabled }}
+  http -> {{ $fullname }}-audit-proxy:{{ .Values.auditProxy.listen.port }} -> {{ .Values.auditProxy.output.type }}{{ if eq .Values.auditProxy.output.type "forward" }} {{ .Values.auditProxy.output.forward.host }}:{{ .Values.auditProxy.output.forward.port }}{{ else if eq .Values.auditProxy.output.type "http" }} {{ .Values.auditProxy.output.http.host }}:{{ .Values.auditProxy.output.http.port }}{{ end }}
+  Audit records are never written to a container's stdout.
+  NOTE: the http device is created at startup, so OpenBao will not start while
+  the audit proxy is unreachable.
+{{- end }}
+{{- if .Values.bootstrap.revokeRootToken }}
+
+ROOT TOKEN
+  Revoked by the bootstrap Job once configuration finished. The unseal keys
+  remain; regenerate a root token only when you actually need one:
+
+       see docs/RESTORE.md — the `generate-root` CLI is broken on 2.6.x;
+       use /v1/sys/generate-root on the backend listener
+{{- end }}
+{{ if .Values.restore.enabled }}
+
+  !! A RESTORE JOB IS ARMED for snapshot "{{ .Values.restore.snapshot }}" ({{ .Values.restore.mode }}).
+  !! Set restore.enabled=false once it has run, or the next upgrade replays it.
+{{- end }}

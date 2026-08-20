@@ -1,0 +1,192 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $fullname := include "obp.baoFullname" . }}
+{{- $ns := include "obp.namespace" . }}
+{{- $np := .Values.networkPolicy }}
+{{- $ap := .Values.auditProxy }}
+{{- $bao := index .Values "openbao" }}
+{{- if $np.defaultDenyIngress }}
+---
+# A fresh namespace has no policies, so nothing is restricted until this exists.
+# Everything below re-opens specific paths.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-default-deny-ingress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+{{- end }}
+{{- if $np.allowSameNamespace }}
+---
+# Raft peers talk to each other on 8200 (join) and 8201 (replication and
+# request forwarding). Without this the cluster cannot form.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-allow-same-namespace
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openbao
+      component: server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: {{ .Values.tls.internal.port }}
+          protocol: TCP
+        - port: {{ .Values.tls.internal.clusterPort }}
+          protocol: TCP
+{{- end }}
+{{- with $np.allowFromNamespaces }}
+---
+# Ingress controllers and any other namespace that needs the API. Restricted to
+# the FRONTEND port when the frontend exists — an ingress controller has no
+# business reaching the backend trust domain.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-allow-from-namespaces
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openbao
+      component: server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+      {{- range . }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+      {{- end }}
+      ports:
+      {{- if $.Values.tls.server.enabled }}
+        - port: {{ $.Values.tls.server.port }}
+          protocol: TCP
+      {{- else }}
+        - port: {{ $.Values.tls.internal.port }}
+          protocol: TCP
+      {{- end }}
+{{- end }}
+{{- if $np.monitoring.enabled }}
+---
+# Scraping is silently dropped by default-deny, and the metrics simply never
+# appear — with no error anywhere. This is the fix.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-allow-monitoring-scrape
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openbao
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $np.monitoring.namespace }}
+      ports:
+        - port: {{ .Values.tls.internal.port }}
+          protocol: TCP
+{{- end }}
+{{- if $ap.enabled }}
+---
+# The audit proxy accepts records from the OpenBao server pods and NOTHING
+# else. This is what makes the plaintext OpenBao -> proxy hop defensible: the
+# audit endpoint is not reachable from any other pod in the namespace, let
+# alone another namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-audit-proxy
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: audit-proxy
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # The server pods, which is where audit records actually come from.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: openbao
+              component: server
+        # The bootstrap Job, which pre-flights this endpoint before allowing
+        # `operator init` to run. Without this the pre-flight is dropped by the
+        # default-deny policy and the bootstrap refuses to initialise.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: bootstrap
+      ports:
+        - port: {{ $ap.listen.port }}
+          protocol: TCP
+    {{- if $np.monitoring.enabled }}
+    # Fluent Bit's own metrics, not audit records.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $np.monitoring.namespace }}
+      ports:
+        - port: {{ $ap.monitorPort }}
+          protocol: TCP
+    {{- end }}
+{{- end }}
+{{- if $np.egress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-egress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openbao
+  policyTypes:
+    - Egress
+  egress:
+    # DNS, always. Omitting it is the classic way to break everything at once.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Peers.
+    - to:
+        - podSelector: {}
+    {{- with $np.egress.rules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,269 @@
+{{- if .Values.bootstrap.enabled }}
+{{- $fullname := include "obp.baoFullname" . }}
+{{- $ns := include "obp.namespace" . }}
+{{- $bao := index .Values "openbao" | default dict }}
+{{- $server := $bao.server | default dict }}
+{{- $img := $server.image | default dict }}
+{{- $bi := .Values.bootstrap.image }}
+{{- $registry := $bi.registry | default ($img.registry | default "docker.io") }}
+{{- $repository := $bi.repository | default ($img.repository | default "openbao/openbao") }}
+{{- $tag := $bi.tag | default ($img.tag | default (trimPrefix "v" .Chart.AppVersion)) }}
+{{- $sa := .Values.bootstrap.serviceAccount.name | default (printf "%s-bootstrap" $fullname) }}
+{{- $ki := .Values.bootstrap.kubectlImage }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # The name carries the revision so that a `helm upgrade` produces a NEW Job
+  # rather than trying to patch an immutable one (Job podspecs cannot be
+  # changed in place, which is the usual cause of "field is immutable" on
+  # upgrade). Old Jobs are left behind on purpose: their logs are the record of
+  # what was configured and when.
+  name: {{ printf "%s-bootstrap-%d" $fullname .Release.Revision | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bootstrap
+  annotations:
+    {{- with .Values.bootstrap.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if .Values.bootstrap.hook.enabled }}
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": {{ .Values.bootstrap.hook.weight | quote }}
+    "helm.sh/hook-delete-policy": {{ .Values.bootstrap.hook.deletePolicy }}
+    {{- end }}
+spec:
+  # One Pod. This is what "only runs on one node" means structurally: there is
+  # no leader election to get wrong and no DaemonSet racing itself.
+  completions: 1
+  parallelism: 1
+  backoffLimit: {{ .Values.bootstrap.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.bootstrap.activeDeadlineSeconds }}
+  {{- with .Values.bootstrap.ttlSecondsAfterFinished }}
+  ttlSecondsAfterFinished: {{ . }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "obp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: bootstrap
+      {{- with .Values.bootstrap.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      restartPolicy: {{ .Values.bootstrap.restartPolicy }}
+      serviceAccountName: {{ $sa }}
+      {{- include "obp.priorityClassName" (dict "root" $ "component" .Values.bootstrap) | nindent 6 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.bootstrap.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.bootstrap.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.bootstrap.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # The OpenBao image ships busybox wget, which supports only GET and POST
+        # and cannot be pointed at the cluster CA — so it cannot write the key
+        # Secret. Rather than run the whole Job from a kubectl image (losing the
+        # `bao` CLI, and with it correct TLS handling and API compatibility), we
+        # borrow just the kubectl binary. Both images are static, so the copy is
+        # a plain file move with no runtime linkage.
+        - name: copy-kubectl
+          image: "{{ $ki.registry }}/{{ $ki.repository }}:{{ $ki.tag }}"
+          imagePullPolicy: {{ $ki.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - cp /usr/local/bin/kubectl /shared/kubectl && chmod 0755 /shared/kubectl
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          {{- with .Values.bootstrap.initResources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: shared-bin
+              mountPath: /shared
+      containers:
+        - name: bootstrap
+          image: "{{ $registry }}/{{ $repository }}:{{ $tag }}"
+          imagePullPolicy: {{ $bi.pullPolicy }}
+          command: ["/bin/sh", "/bootstrap/bootstrap.sh"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          {{- with .Values.bootstrap.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: PATH
+              value: /shared:/usr/local/bin:/usr/bin:/bin
+            - name: HOME
+              value: /tmp
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RELEASE_NAME
+              value: {{ .Release.Name | quote }}
+            - name: FULLNAME
+              value: {{ $fullname | quote }}
+            - name: HEADLESS
+              value: {{ include "obp.baoHeadless" . | quote }}
+            - name: REPLICAS
+              value: {{ include "obp.replicas" . | quote }}
+            - name: BAO_PORT
+              value: {{ .Values.tls.internal.port | quote }}
+            {{- if .Values.tls.enabled }}
+            - name: BAO_CACERT
+              value: {{ include "obp.internalCaPath" . | quote }}
+            {{- end }}
+            - name: WAIT_TIMEOUT
+              value: {{ .Values.bootstrap.waitTimeoutSeconds | quote }}
+            - name: NODE_WAIT_TIMEOUT
+              value: {{ .Values.bootstrap.nodeWaitTimeoutSeconds | default 300 | quote }}
+
+            # -- init ------------------------------------------------------
+            - name: KEY_SHARES
+              value: {{ .Values.bootstrap.init.keyShares | quote }}
+            - name: KEY_THRESHOLD
+              value: {{ .Values.bootstrap.init.keyThreshold | quote }}
+            - name: AUTO_UNSEAL
+              value: {{ .Values.bootstrap.init.autoUnseal | quote }}
+            - name: DO_UNSEAL
+              value: {{ .Values.bootstrap.unseal.enabled | quote }}
+            {{- with .Values.bootstrap.init.extraArgs }}
+            - name: INIT_EXTRA_ARGS
+              value: {{ join " " . | quote }}
+            {{- end }}
+            - name: SECRET_NAME
+              value: {{ include "obp.initKeysSecret" . | quote }}
+            # Rendered by the three-condition gate in _helpers.tpl. Anything
+            # other than the literal "true" keeps the keys out of this log.
+            - name: REVEAL_KEYS
+              value: {{ include "obp.revealKeys" . | quote }}
+            {{- with .Values.bootstrap.tokenSecret }}
+            {{- if .name }}
+            - name: BAO_TOKEN_OVERRIDE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .name }}
+                  key: {{ .key | default "token" }}
+                  optional: true
+            {{- end }}
+            {{- end }}
+
+            # -- autopilot -------------------------------------------------
+            - name: AUTOPILOT_ENABLED
+              value: {{ .Values.bootstrap.autopilot.enabled | quote }}
+            - name: AUTOPILOT_CLEANUP
+              value: {{ .Values.bootstrap.autopilot.cleanupDeadServers | quote }}
+            - name: AUTOPILOT_DEAD_THRESHOLD
+              value: {{ .Values.bootstrap.autopilot.deadServerLastContactThreshold | quote }}
+            - name: AUTOPILOT_STABILIZATION
+              value: {{ .Values.bootstrap.autopilot.serverStabilizationTime | quote }}
+            - name: AUTOPILOT_MIN_QUORUM
+              value: {{ .Values.bootstrap.autopilot.minQuorum | quote }}
+
+            # -- audit pre-flight ------------------------------------------
+{{- $ad := (($bao.server).auditDevices) | default dict }}
+            - name: AUDIT_HTTP_ENABLED
+              value: {{ (($ad.http).enabled) | default false | quote }}
+            - name: AUDIT_HTTP_URL
+              value: {{ printf "http://%s:%v/%s" (($ad.http).host | default (printf "%s-audit-proxy.%s.svc" $fullname $ns)) ((($ad.http).port) | default 9880) ((($ad.http).uriPath) | default "openbao.audit") | quote }}
+            - name: AUDIT_WAIT_TIMEOUT
+              value: {{ .Values.bootstrap.auditWaitTimeoutSeconds | default 180 | quote }}
+
+            - name: REVOKE_ROOT
+              value: {{ .Values.bootstrap.revokeRootToken | quote }}
+
+            # -- kubernetes jwt/oidc ---------------------------------------
+            - name: K8S_AUTH_ENABLED
+              value: {{ .Values.bootstrap.kubernetesAuth.enabled | quote }}
+            - name: K8S_AUTH_PATH
+              value: {{ .Values.bootstrap.kubernetesAuth.path | quote }}
+            - name: K8S_AUTH_AUDIENCE
+              value: {{ .Values.bootstrap.kubernetesAuth.audience | quote }}
+            - name: K8S_AUTH_DISCOVERY
+              value: {{ .Values.bootstrap.kubernetesAuth.discovery | default "in-cluster" | quote }}
+            - name: K8S_BOUND_ISSUER
+              value: {{ .Values.bootstrap.kubernetesAuth.boundIssuer | quote }}
+            - name: SNAPSHOT_ENABLED
+              value: {{ .Values.bootstrap.snapshot.enabled | quote }}
+            - name: SNAPSHOT_ROLE
+              value: {{ .Values.bootstrap.snapshot.role | quote }}
+            - name: SNAPSHOT_POLICY
+              value: {{ .Values.bootstrap.snapshot.policyName | quote }}
+            - name: SNAPSHOT_SUBJECT
+              value: {{ printf "system:serviceaccount:%s:%s" $ns (.Values.snapshotAgent.serviceAccount.name | default (printf "%s-snapshot" $fullname)) | quote }}
+            - name: SNAPSHOT_TTL
+              value: {{ .Values.bootstrap.snapshot.tokenTtl | quote }}
+            - name: SNAPSHOT_MAX_TTL
+              value: {{ .Values.bootstrap.snapshot.tokenMaxTtl | quote }}
+
+            # -- gitlab ----------------------------------------------------
+            - name: GITLAB_ENABLED
+              value: {{ .Values.bootstrap.gitlab.enabled | quote }}
+            - name: GITLAB_PATH
+              value: {{ .Values.bootstrap.gitlab.path | quote }}
+            - name: GITLAB_URL
+              value: {{ .Values.bootstrap.gitlab.url | quote }}
+            - name: GITLAB_ISSUER
+              value: {{ .Values.bootstrap.gitlab.boundIssuer | default .Values.bootstrap.gitlab.url | quote }}
+          volumeMounts:
+            - name: shared-bin
+              mountPath: /shared
+              readOnly: true
+            - name: bootstrap
+              mountPath: /bootstrap
+              readOnly: true
+            {{- if .Values.tls.enabled }}
+            - name: tls-internal
+              mountPath: {{ .Values.tls.internal.mountPath }}
+              readOnly: true
+            {{- end }}
+            # readOnlyRootFilesystem is on, so mktemp needs somewhere to write.
+            # Memory-backed: the unseal keys pass through here and must never be
+            # written to a node's disk.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: shared-bin
+          emptyDir: {}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        - name: bootstrap
+          configMap:
+            name: {{ $fullname }}-bootstrap
+            defaultMode: 0555
+        {{- if .Values.tls.enabled }}
+        - name: tls-internal
+          secret:
+            secretName: {{ include "obp.internalTlsSecret" . }}
+            defaultMode: 0400
+        {{- end }}
+      {{- with (($bao.global).imagePullSecrets) }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

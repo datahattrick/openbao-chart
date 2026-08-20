@@ -1,0 +1,257 @@
+# heathernetes — the single-node k3s homelab cluster.
+#
+# Install with the release name `openbao`; it is load-bearing. Every subchart
+# resource name derives from the RELEASE name, and the TLS/init Secret names in
+# values.yaml are written to match `openbao`. Rename the release and the render
+# fails loudly in _validate.tpl rather than deploying something broken.
+#
+#   helm upgrade --install openbao charts/openbao-platform \
+#     -n openbao -f charts/openbao-platform/values-heathernetes.yaml
+
+deployment:
+  environment: production
+
+# OpenBao being evicted takes every dependent workload with it, so it gets a
+# high class. `system-cluster-critical` ships with every cluster and is usable
+# outside kube-system (verified by server-side dry-run). The subchart reads its
+# own key, so both are set — the render fails if only one is.
+priorityClassName: system-cluster-critical
+
+clusterDomain: cluster.local
+
+namespace:
+  create: false          # created by scripts/prepare-namespace.sh, with PSA labels
+
+tls:
+  enabled: true
+  ca:
+    create: true         # namespace-local backend CA, isolated from grom-ca
+  internal:
+    port: 8200
+  server:
+    enabled: true
+    port: 8210
+    # The frontend trust domain is the existing homelab CA — deliberately a
+    # DIFFERENT issuer from the backend CA above. grom-ca can issue certs for
+    # anything in the cluster; it cannot mint a raft peer.
+    issuerRef:
+      name: grom-ca
+      kind: ClusterIssuer
+      group: cert-manager.io
+    dnsNames:
+      - openbao.apps.grom.internal
+
+ingress:
+  enabled: true
+  className: traefik
+  host: openbao.apps.grom.internal
+  # Traefik terminates with its cluster-wide default certificate (the TLSStore
+  # named `default` in kube-system), so no tls: block is needed here — that is
+  # the existing homelab convention. What IS needed is telling Traefik to
+  # re-encrypt to the frontend listener rather than speaking plaintext to 8210.
+  tls:
+    enabled: false
+  traefik:
+    serversTransport:
+      enabled: true
+      insecureSkipVerify: false
+
+networkPolicy:
+  enabled: true
+  allowFromNamespaces:
+    - kube-system        # Traefik
+  monitoring:
+    enabled: true
+    namespace: monitoring
+
+monitoring:
+  vmServiceScrape:
+    enabled: true
+
+# -----------------------------------------------------------------------------
+# Audit forwarding -> VictoriaLogs
+# -----------------------------------------------------------------------------
+# There is no Fluent Bit aggregator on this cluster, so the proxy ships straight
+# into VictoriaLogs' JSON-lines ingest endpoint. Swap output.type to `forward`
+# and point it at your Fluent Bit when one exists — nothing else changes.
+auditProxy:
+  enabled: true
+  replicaCount: 1        # single node
+  output:
+    type: http
+    http:
+      host: vlsingle-vm-stack-victoria-metrics-k8s-stack.monitoring.svc.cluster.local
+      port: 9428
+      uri: /insert/jsonline?_stream_fields=log_source,openbao_cluster&_msg_field=type&_time_field=time
+      format: json_lines
+      tls:
+        enabled: false
+    # The monitoring namespace runs default-deny-ingress, so without this the
+    # audit proxy buffers forever and nothing reaches VictoriaLogs.
+    downstreamNetworkPolicy:
+      enabled: true
+      namespace: monitoring
+
+bootstrap:
+  enabled: true
+  init:
+    keyShares: 5
+    keyThreshold: 3
+  keyOutput:
+    # Left at the default (false). Extract the keys with
+    #   kubectl -n openbao get secret openbao-init-keys -o yaml
+    # rather than widening read access to anyone who can exec into a pod.
+    mountIntoServer: false
+  # Root is revoked at the end of bootstrap; regenerate with
+  # `bao operator generate-root` and the unseal keys if it is ever needed again.
+  revokeRootToken: true
+  kubernetesAuth:
+    enabled: true
+    path: kubernetes
+    audience: openbao
+  snapshot:
+    enabled: true
+    role: bao-snapshot
+  gitlab:
+    # No GitLab on this cluster yet. The shape below is what to fill in.
+    enabled: false
+    url: ""
+    audience: https://openbao.apps.grom.internal
+    policies:
+      opentofu: |
+        # Enough to manage mounts, policies and auth methods from CI, and to
+        # read/write the kv store. Deliberately NOT sudo on sys/ as a whole.
+        path "sys/mounts"                { capabilities = ["read", "list"] }
+        path "sys/mounts/*"              { capabilities = ["create", "read", "update", "delete", "list"] }
+        path "sys/policies/acl"          { capabilities = ["list"] }
+        path "sys/policies/acl/*"        { capabilities = ["create", "read", "update", "delete", "list"] }
+        path "sys/auth"                  { capabilities = ["read", "list"] }
+        path "sys/auth/*"                { capabilities = ["create", "read", "update", "delete", "sudo"] }
+        path "auth/*"                    { capabilities = ["create", "read", "update", "delete", "list"] }
+        path "kv/*"                      { capabilities = ["create", "read", "update", "delete", "list"] }
+    roles:
+      - name: opentofu
+        policies: [opentofu]
+        tokenTtl: 30m
+        tokenMaxTtl: 1h
+        userClaim: project_path
+        boundClaims:
+          project_path: CHANGEME/openbao-config
+          ref: main
+          ref_type: branch
+          ref_protected: "true"
+
+# -----------------------------------------------------------------------------
+# Raft snapshots -> Garage S3
+# -----------------------------------------------------------------------------
+# Talks to Garage over the in-cluster service rather than the S3 ingress: it
+# keeps the traffic inside the cluster and avoids needing the grom CA in the
+# snapshot-agent image.
+snapshotAgent:
+  enabled: true
+  # Daily at 02:00. Was 6-hourly; a full copy of the store four times a day
+  # mostly bought storage cost.
+  schedule: "0 2 * * *"
+  timeZone: Pacific/Auckland
+  concurrencyPolicy: Forbid
+  serviceAccount:
+    create: true
+    name: openbao-snapshot
+  auth:
+    path: kubernetes
+    role: bao-snapshot
+    audience: openbao
+  s3:
+    host: garage.storage.svc.cluster.local:3900
+    # This becomes s3cmd's --host-bucket, and for path-style access it must be
+    # the BARE HOST.
+    #
+    # The intuitive `<host>/%(bucket)s` form is what the s3cmd docs suggest for
+    # path style, and it fails against Garage with
+    #   403 (AccessDenied): Forbidden: Invalid signature
+    # because the substituted value ends up in the SigV4 signing string and no
+    # longer matches the Host header. The error names the signature, so it
+    # reads like a credentials problem and sends you looking in the wrong place
+    # entirely. Verified by testing both forms directly.
+    bucket: garage.storage.svc.cluster.local:3900
+    uri: s3://backups/openbao/
+    expireDays: "30"
+    # --no-ssl : the in-cluster Garage endpoint is plain HTTP.
+    # --region : matches Garage's s3_region. Not strictly required (uploads
+    #            succeed without it), but correct.
+    extraFlags: "--no-ssl --region=garage"
+    # Copied out of storage/garage-s3-credentials by
+    # scripts/prepare-namespace.sh -- Secrets are namespaced.
+    credentialsSecret: garage-s3-credentials
+
+# =============================================================================
+openbao:
+  server:
+    priorityClassName: system-cluster-critical
+    logLevel: info
+    logFormat: json
+
+    # Declared in the config file, so OpenBao applies them at startup.
+    auditDevices:
+      file:
+        enabled: true
+        filePath: /openbao/audit/audit.log
+      http:
+        enabled: true
+        port: 9880
+        uriPath: openbao.audit
+
+    dataStorage:
+      size: 8Gi
+      # ZFS mirror, not the OS SSD.
+      storageClass: local-path-bulk
+    auditStorage:
+      size: 4Gi
+      storageClass: local-path-bulk
+
+    ha:
+      enabled: true
+      # ---------------------------------------------------------------------
+      # THREE replicas on ONE node.
+      #
+      # This is a real 3-voter raft cluster: real quorum, real leader election,
+      # real retry_join, and autopilot's cleanup_dead_servers/min_quorum become
+      # legal (they require >= 3). What it does NOT give is machine-level fault
+      # tolerance — all three are on heathernetes, so the node is still a single
+      # point of failure. It exercises the HA code paths; it is not HA.
+      #
+      # Requires affinity: {} below, since the upstream default demands one
+      # node per replica.
+      # ---------------------------------------------------------------------
+      replicas: 3
+      # Stable per-pod DNS for api_addr. Must match the release name.
+      apiAddr: https://$(BAO_K8S_POD_NAME).openbao-internal.$(BAO_K8S_NAMESPACE).svc:8200
+      disruptionBudget:
+        enabled: true
+        # The upstream default is (n/2)-1, which is 0 for a 3-node cluster and
+        # would block every voluntary eviction outright. 1 is correct: a 3-voter
+        # raft cluster keeps quorum with one node down.
+        #
+        # Under Shamir, note that an evicted node comes back SEALED and needs
+        # scripts/unseal.sh — the PDB protects quorum, not availability.
+        maxUnavailable: 1
+
+    # The upstream default requires each replica on a distinct node, which
+    # cannot be satisfied here.
+    affinity: {}
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "2"
+        memory: 1Gi
+
+    # Enables the FRONTEND listener. Must be present whenever
+    # tls.server.enabled is true — this entry is what makes the raft HCL emit
+    # the second listener.
+    extraPorts:
+      - containerPort: 8210
+        name: https-frontend
+        protocol: TCP

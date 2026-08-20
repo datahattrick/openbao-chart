@@ -1,0 +1,184 @@
+{{- if .Values.snapshotAgent.enabled }}
+{{- $fullname := include "obp.baoFullname" . }}
+{{- $ns := include "obp.namespace" . }}
+{{- $sa := .Values.snapshotAgent.serviceAccount.name | default (printf "%s-snapshot" $fullname) }}
+{{- $s := .Values.snapshotAgent }}
+{{- $bao := index .Values "openbao" }}
+{{- if $s.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: snapshot
+  {{- with $s.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+# The agent authenticates to OpenBao with an audience-bound PROJECTED token,
+# not this one.
+automountServiceAccountToken: false
+---
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-snapshot
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: snapshot
+data:
+  BAO_ADDR: {{ include "obp.baoInternalAddr" . | quote }}
+  BAO_AUTH_PATH: {{ $s.auth.path | quote }}
+  BAO_ROLE: {{ $s.auth.role | quote }}
+  TOKEN_PATH: {{ $s.auth.tokenPath | quote }}
+  S3_HOST: {{ $s.s3.host | quote }}
+  S3_BUCKET: {{ $s.s3.bucket | quote }}
+  S3_URI: {{ $s.s3.uri | quote }}
+  S3_EXPIRE_DAYS: {{ $s.s3.expireDays | quote }}
+  {{- with $s.s3.extraFlags }}
+  S3CMD_EXTRA_FLAG: {{ . | quote }}
+  {{- end }}
+  {{- with $s.s3.baoSecretPath }}
+  BAO_SECRET_PATH: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.tls.enabled }}
+  BAO_CACERT: {{ include "obp.internalCaPath" . | quote }}
+  {{- end }}
+  {{- range $k, $v := $s.extraEnv }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $fullname }}-snapshot
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: snapshot
+  {{- with $s.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  schedule: {{ $s.schedule | quote }}
+  {{- with $s.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
+  # Forbid: a snapshot whose upload overruns the schedule must not have a
+  # second `snapshot save` started beside it against the same node. This is the
+  # setting the upstream chart's CronJob does not expose, and the reason this
+  # template exists.
+  concurrencyPolicy: {{ $s.concurrencyPolicy }}
+  startingDeadlineSeconds: {{ $s.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ $s.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ $s.failedJobsHistoryLimit }}
+  suspend: {{ $s.suspend }}
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "obp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: snapshot
+    spec:
+      backoffLimit: {{ $s.backoffLimit }}
+      activeDeadlineSeconds: {{ $s.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "obp.labels" . | nindent 12 }}
+            app.kubernetes.io/component: snapshot
+          {{- with $s.podAnnotations }}
+          annotations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        spec:
+          restartPolicy: {{ $s.restartPolicy }}
+          serviceAccountName: {{ $sa }}
+          {{- include "obp.priorityClassName" (dict "root" $ "component" $s) | nindent 10 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          {{- with $s.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $s.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: bao-snapshot
+              image: "{{ $s.image.registry }}/{{ $s.image.repository }}:{{ $s.image.tag }}"
+              imagePullPolicy: {{ $s.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                {{- toYaml $s.resources | nindent 16 }}
+              envFrom:
+                - configMapRef:
+                    name: {{ $fullname }}-snapshot
+              env:
+                - name: HOME
+                  value: /tmp
+                {{- with $s.s3.credentialsSecret }}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ . }}
+                      key: AWS_ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ . }}
+                      key: AWS_SECRET_ACCESS_KEY
+                {{- end }}
+              volumeMounts:
+                - name: snapshot-dir
+                  mountPath: /bao-snapshots
+                - name: tmp
+                  mountPath: /tmp
+                {{- if .Values.tls.enabled }}
+                - name: tls-internal
+                  mountPath: {{ .Values.tls.internal.mountPath }}
+                  readOnly: true
+                {{- end }}
+                - name: bao-token
+                  mountPath: {{ dir $s.auth.tokenPath }}
+                  readOnly: true
+          volumes:
+            - name: snapshot-dir
+              emptyDir: {}
+            - name: tmp
+              emptyDir: {}
+            {{- if .Values.tls.enabled }}
+            - name: tls-internal
+              secret:
+                secretName: {{ include "obp.internalTlsSecret" . }}
+                items:
+                  - key: ca.crt
+                    path: ca.crt
+            {{- end }}
+            - name: bao-token
+              projected:
+                sources:
+                  - serviceAccountToken:
+                      path: {{ base $s.auth.tokenPath }}
+                      # Bound to OpenBao, so a compromised snapshot pod cannot
+                      # replay this token against the Kubernetes API.
+                      audience: {{ $s.auth.audience }}
+                      expirationSeconds: {{ $s.auth.tokenExpirationSeconds }}
+          {{- with ($bao.global).imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

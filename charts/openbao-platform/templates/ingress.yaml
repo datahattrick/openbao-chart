@@ -1,0 +1,168 @@
+{{- $fullname := include "obp.baoFullname" . }}
+{{- $ns := include "obp.namespace" . }}
+{{- $bao := index .Values "openbao" }}
+{{- $ha := (($bao.server).ha) | default dict }}
+{{- $svc := printf "%s-frontend" $fullname }}
+{{- $st := printf "%s-frontend" $fullname }}
+{{- if .Values.ingress.traefik.serversTransport.name }}{{ $st = .Values.ingress.traefik.serversTransport.name }}{{ end }}
+{{- if and .Values.tls.server.enabled (or .Values.ingress.enabled .Values.route.enabled) }}
+---
+# A dedicated Service for the FRONTEND listener, owned by this chart rather
+# than the subchart.
+#
+# Two reasons it is not just an extra port on the subchart's Service:
+#
+#  1. Traefik's `traefik.ingress.kubernetes.io/service.*` annotations are read
+#     from the SERVICE, not from the Ingress. Putting them on the Ingress is
+#     silently ignored: Traefik then dials the backend with its default
+#     transport and fails with "cannot validate certificate for <pod IP>
+#     because it doesn't contain any IP SANs". Owning the Service is what lets
+#     this chart compute the ServersTransport reference, which embeds both the
+#     namespace and the release name and so cannot be a literal in subchart
+#     values.
+#  2. It keeps the frontend trust domain's routing entirely in one place.
+#
+# In HA it selects only the active node, matching the label OpenBao's
+# Kubernetes service registration sets on the leader — so external clients are
+# never sent to a standby that would only redirect them.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svc }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    openbao.platform/trust-domain: frontend
+  annotations:
+    {{- if .Values.ingress.traefik.serversTransport.enabled }}
+    # The backend speaks TLS, so Traefik must re-encrypt rather than send
+    # plaintext to 8210.
+    traefik.ingress.kubernetes.io/service.serversscheme: https
+    traefik.ingress.kubernetes.io/service.serverstransport: {{ printf "%s-%s@kubernetescrd" $ns $st }}
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: https-frontend
+      port: {{ .Values.tls.server.port }}
+      targetPort: {{ .Values.tls.server.port }}
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: openbao
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    component: server
+    {{- if eq ($ha.enabled | toString) "true" }}
+    openbao-active: "true"
+    {{- end }}
+{{- end }}
+{{- if .Values.ingress.enabled }}
+{{- if .Values.ingress.traefik.serversTransport.enabled }}
+---
+# Traefik dials the backend over plain HTTP unless told otherwise, and OpenBao's
+# frontend listener speaks only TLS. This tells Traefik to use HTTPS and, more
+# importantly, WHICH CA to trust — rather than reaching for insecureSkipVerify,
+# which would silently accept any certificate and undo the point of a separate
+# frontend trust domain.
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: {{ $st }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+spec:
+  serverName: {{ first .Values.tls.server.dnsNames | quote }}
+  {{- if .Values.ingress.traefik.serversTransport.insecureSkipVerify }}
+  insecureSkipVerify: true
+  {{- else }}
+  # `rootCAs`, not the older `rootCAsSecrets`, which Traefik 3.x logs as
+  # deprecated on every reconcile.
+  rootCAs:
+    - secret: {{ .Values.ingress.traefik.serversTransport.rootCAsSecretName | default (include "obp.serverTlsSecret" .) }}
+  {{- end }}
+---
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    {{- with .Values.ingress.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host }}
+      {{- with .Values.ingress.tls.secretName }}
+      secretName: {{ . }}
+      {{- end }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.path }}
+            pathType: {{ .Values.ingress.pathType }}
+            backend:
+              service:
+                name: {{ $svc }}
+                port:
+                  # The FRONTEND listener. Never 8200 — that is the backend
+                  # trust domain and an ingress controller has no business
+                  # terminating against it.
+                  number: {{ .Values.tls.server.port }}
+{{- end }}
+{{- if .Values.route.enabled }}
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    {{- with .Values.route.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.route.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.route.host }}
+  host: {{ . | quote }}
+  {{- end }}
+  to:
+    kind: Service
+    name: {{ $svc }}
+    weight: 100
+  port:
+    targetPort: https-frontend
+  tls:
+    termination: {{ .Values.route.termination }}
+    insecureEdgeTerminationPolicy: {{ .Values.route.insecureEdgeTerminationPolicy }}
+    {{- if eq .Values.route.termination "reencrypt" }}
+    {{- with .Values.route.destinationCACertificate }}
+    # The router must trust what the frontend listener presents on the second
+    # leg. Leave this empty and OpenShift falls back to the service CA, which
+    # will NOT match a cert-manager-issued certificate.
+    destinationCACertificate: |
+      {{- . | nindent 6 }}
+    {{- end }}
+    {{- end }}
+  wildcardPolicy: None
+{{- end }}

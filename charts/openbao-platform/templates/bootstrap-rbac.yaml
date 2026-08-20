@@ -1,0 +1,62 @@
+{{- if and .Values.bootstrap.enabled .Values.bootstrap.serviceAccount.create }}
+{{- $fullname := include "obp.baoFullname" . }}
+{{- $ns := include "obp.namespace" . }}
+{{- $sa := .Values.bootstrap.serviceAccount.name | default (printf "%s-bootstrap" $fullname) }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bootstrap
+  {{- with .Values.bootstrap.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: true
+---
+# The bootstrap Job's entire reason for needing the API server is writing the
+# init keys into a Secret, so that is all it may do — and only to the two
+# Secrets it owns, by name.
+#
+# Note in particular: no `list` on secrets. `get` on a named resource does not
+# let the holder enumerate the namespace, so a compromised bootstrap pod cannot
+# read the TLS private keys or the S3 credentials sitting beside it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-bootstrap
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bootstrap
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - {{ include "obp.initKeysSecret" . }}
+    verbs: ["get", "update", "patch", "delete"]
+  # `create` cannot be restricted by resourceName — the name does not exist yet
+  # at admission time. This is the one unavoidably broad verb here.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-bootstrap
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bootstrap
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-bootstrap
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $ns }}
+{{- end }}

@@ -1,0 +1,48 @@
+# OpenShift overlay. Layer on top of values.yaml:
+#   helm install openbao . -f values-openshift.yaml -f values-prod.yaml
+#
+# What actually differs on OpenShift:
+#   - SCCs, not Pod Security Admission. The upstream chart drops its own
+#     securityContext when global.openshift is true so the SCC can assign a uid
+#     from the namespace's range; forcing runAsUser fights that, so the
+#     explicit contexts are cleared here.
+#   - Routes, not Ingress.
+#   - UBI images from a registry the cluster is entitled to.
+openbao:
+  global:
+    openshift: true
+
+  server:
+    image:
+      registry: quay.io
+      repository: openbao/openbao-ubi
+
+    # Let the SCC choose the uid/gid. Empty maps mean the subchart emits no
+    # securityContext at all when global.openshift is set.
+    statefulSet:
+      securityContext:
+        pod: {}
+        container: {}
+
+    # The default exec probe shells out to `bao`; the http form avoids that and
+    # reports 204 while uninitialised, which stops the pod flapping between
+    # install and bootstrap.
+    readinessProbe:
+      path: /v1/sys/health?standbyok=true&uninitcode=204
+
+  snapshotAgent:
+    securityContext:
+      pod: {}
+      container: {}
+
+# The OpenShift router terminates instead of an Ingress controller.
+ingress:
+  enabled: false
+route:
+  enabled: true
+  termination: reencrypt
+  insecureEdgeTerminationPolicy: Redirect
+
+# Pod Security labels are ignored here; SCCs do the work.
+namespace:
+  create: false

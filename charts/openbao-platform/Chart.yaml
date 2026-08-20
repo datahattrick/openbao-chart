@@ -1,0 +1,40 @@
+apiVersion: v2
+name: openbao-platform
+description: >-
+  Opinionated umbrella around the official OpenBao chart: cert-manager PKI with
+  split frontend/backend trust domains, a one-shot bootstrap Job that initialises
+  and unseals the cluster, JWT/OIDC auth for the Kubernetes snapshot service
+  account and GitLab CI, and the raft snapshot CronJob. Built for OpenShift and
+  airgapped installs.
+type: application
+
+# Chart version. Bump on every change to this chart.
+version: 0.1.0
+
+# Tracks the OpenBao release the pinned subchart deploys.
+appVersion: "2.6.2"
+
+icon: https://raw.githubusercontent.com/openbao/artwork/refs/heads/main/color/openbao-color.svg
+
+kubeVersion: ">= 1.30.0-0"
+
+keywords:
+  - openbao
+  - vault
+  - secrets
+  - raft
+  - cert-manager
+  - openshift
+  - airgap
+
+annotations:
+  # Red Hat chart certification metadata; harmless elsewhere.
+  charts.openshift.io/name: OpenBao Platform
+  charts.openshift.io/provider: internal
+
+dependencies:
+  - name: openbao
+    version: 0.29.2
+    repository: https://openbao.github.io/openbao-helm
+    # No condition: the server is the whole point of this chart. Individual
+    # components (injector, csi, ui) are toggled inside the subchart values.

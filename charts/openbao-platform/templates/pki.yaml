@@ -1,0 +1,221 @@
+{{- include "obp.validate" . }}
+{{- if .Values.tls.enabled }}
+{{- $fullname := include "obp.baoFullname" . }}
+{{- $ns := include "obp.namespace" . }}
+{{- $domain := include "obp.clusterDomain" . }}
+{{- $headless := include "obp.baoHeadless" . }}
+{{- $replicas := int (include "obp.replicas" .) }}
+{{- $bao := index .Values "openbao" | default dict }}
+{{- $ha := (($bao.server).ha) | default dict }}
+---
+{{- if .Values.tls.ca.create }}
+# =============================================================================
+# BACKEND trust domain
+# =============================================================================
+# A self-signed root that exists only in this namespace and signs only the
+# certificates raft peers validate each other's API endpoint against.
+#
+# An Issuer, not a ClusterIssuer, on purpose: a ClusterIssuer can be referenced
+# from any namespace, so anyone able to create a Certificate anywhere in the
+# cluster could mint something a raft join would trust. Namespacing the CA makes
+# that impossible without RBAC in this namespace.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ .Values.tls.ca.selfSignedIssuerName | default (printf "%s-selfsigned" $fullname) }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    openbao.platform/trust-domain: backend
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $fullname }}-backend-ca
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    openbao.platform/trust-domain: backend
+spec:
+  isCA: true
+  commonName: {{ .Values.tls.ca.commonName | default (printf "%s backend CA" $fullname) | quote }}
+  secretName: {{ include "obp.caSecret" . }}
+  duration: {{ .Values.tls.ca.duration }}
+  renewBefore: {{ .Values.tls.ca.renewBefore }}
+  privateKey:
+    algorithm: {{ .Values.tls.ca.privateKey.algorithm }}
+    size: {{ .Values.tls.ca.privateKey.size }}
+    encoding: PKCS8
+  usages:
+    - cert sign
+    - crl sign
+  issuerRef:
+    name: {{ .Values.tls.ca.selfSignedIssuerName | default (printf "%s-selfsigned" $fullname) }}
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $fullname }}-backend-ca
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    openbao.platform/trust-domain: backend
+spec:
+  ca:
+    secretName: {{ include "obp.caSecret" . }}
+{{- end }}
+---
+# The certificate the BACKEND listener (port {{ .Values.tls.internal.port }}) presents.
+#
+# Every name a peer, probe or in-cluster client may dial has to be in here. The
+# per-pod names matter most: retry_join addresses each peer by its stable
+# StatefulSet DNS name, and api_addr redirects use the same form.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $fullname }}-tls-internal
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    openbao.platform/trust-domain: backend
+spec:
+  secretName: {{ include "obp.internalTlsSecret" . }}
+  duration: {{ .Values.tls.internal.duration }}
+  renewBefore: {{ .Values.tls.internal.renewBefore }}
+  privateKey:
+    algorithm: {{ .Values.tls.internal.privateKey.algorithm }}
+    size: {{ .Values.tls.internal.privateKey.size }}
+    rotationPolicy: {{ .Values.tls.internal.privateKey.rotationPolicy }}
+    encoding: PKCS8
+  usages:
+    - server auth
+    # Needed when tls.internal.mutualTls is on, and harmless otherwise: the same
+    # certificate is then presented as the client credential on a raft join.
+    - client auth
+  commonName: {{ printf "%s.%s.svc" $fullname $ns | quote }}
+  dnsNames:
+    # Round-robin service
+    - {{ $fullname }}
+    - {{ printf "%s.%s" $fullname $ns }}
+    - {{ printf "%s.%s.svc" $fullname $ns }}
+    - {{ printf "%s.%s.svc.%s" $fullname $ns $domain }}
+    # Headless service used for peer DNS
+    - {{ $headless }}
+    - {{ printf "%s.%s" $headless $ns }}
+    - {{ printf "%s.%s.svc" $headless $ns }}
+    - {{ printf "%s.%s.svc.%s" $headless $ns $domain }}
+{{- if eq ($ha.enabled | toString) "true" }}
+    # Leader/follower services created in HA mode
+    - {{ printf "%s-active" $fullname }}
+    - {{ printf "%s-active.%s" $fullname $ns }}
+    - {{ printf "%s-active.%s.svc" $fullname $ns }}
+    - {{ printf "%s-active.%s.svc.%s" $fullname $ns $domain }}
+    - {{ printf "%s-standby" $fullname }}
+    - {{ printf "%s-standby.%s" $fullname $ns }}
+    - {{ printf "%s-standby.%s.svc" $fullname $ns }}
+    - {{ printf "%s-standby.%s.svc.%s" $fullname $ns $domain }}
+{{- end }}
+    # Per-pod names. retry_join and api_addr both use these, so an omission here
+    # shows up as a cluster that will not form rather than as a TLS warning.
+{{- range $i := until $replicas }}
+    - {{ printf "%s-%d.%s" $fullname $i $headless }}
+    - {{ printf "%s-%d.%s.%s" $fullname $i $headless $ns }}
+    - {{ printf "%s-%d.%s.%s.svc" $fullname $i $headless $ns }}
+    - {{ printf "%s-%d.%s.%s.svc.%s" $fullname $i $headless $ns $domain }}
+{{- end }}
+    # BAO_ADDR inside the container is https://127.0.0.1:8200, which is what
+    # `kubectl exec … bao status` and the bootstrap Job's local calls use.
+    - localhost
+{{- range .Values.tls.internal.extraDnsNames }}
+    - {{ . | quote }}
+{{- end }}
+  ipAddresses:
+    - 127.0.0.1
+    - ::1
+{{- range .Values.tls.internal.extraIpAddresses }}
+    - {{ . | quote }}
+{{- end }}
+  issuerRef:
+    {{- include "obp.internalIssuerRef" . | nindent 4 }}
+{{- if .Values.tls.server.enabled }}
+---
+# =============================================================================
+# FRONTEND trust domain
+# =============================================================================
+# The certificate the FRONTEND listener (port {{ .Values.tls.server.port }})
+# presents. Issued by a DIFFERENT issuer, and carrying only public-facing names:
+# it is never valid for a peer address, so it cannot be used to join the raft
+# cluster even if the frontend CA is compromised.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $fullname }}-tls-server
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    openbao.platform/trust-domain: frontend
+spec:
+  secretName: {{ include "obp.serverTlsSecret" . }}
+  duration: {{ .Values.tls.server.duration }}
+  renewBefore: {{ .Values.tls.server.renewBefore }}
+  privateKey:
+    algorithm: {{ .Values.tls.server.privateKey.algorithm }}
+    size: {{ .Values.tls.server.privateKey.size }}
+    rotationPolicy: {{ .Values.tls.server.privateKey.rotationPolicy }}
+    encoding: PKCS8
+  usages:
+    - server auth
+{{- with .Values.tls.server.dnsNames }}
+  commonName: {{ first . | quote }}
+  dnsNames:
+{{- range . }}
+    - {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- with .Values.tls.server.ipAddresses }}
+  ipAddresses:
+{{- range . }}
+    - {{ . | quote }}
+{{- end }}
+{{- end }}
+  issuerRef:
+    name: {{ .Values.tls.server.issuerRef.name }}
+    kind: {{ .Values.tls.server.issuerRef.kind }}
+    group: {{ .Values.tls.server.issuerRef.group }}
+{{- end }}
+{{- if and .Values.auditProxy.enabled .Values.auditProxy.tls.enabled }}
+---
+# The audit proxy is a backend component, so it is issued from the backend CA.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $fullname }}-audit-proxy
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    openbao.platform/trust-domain: backend
+spec:
+  secretName: {{ .Values.auditProxy.tls.secretName | default (printf "%s-audit-proxy-tls" $fullname) }}
+  duration: {{ .Values.tls.internal.duration }}
+  renewBefore: {{ .Values.tls.internal.renewBefore }}
+  privateKey:
+    algorithm: {{ .Values.tls.internal.privateKey.algorithm }}
+    size: {{ .Values.tls.internal.privateKey.size }}
+    rotationPolicy: {{ .Values.tls.internal.privateKey.rotationPolicy }}
+    encoding: PKCS8
+  usages:
+    - server auth
+  commonName: {{ printf "%s-audit-proxy.%s.svc" $fullname $ns | quote }}
+  dnsNames:
+    - {{ printf "%s-audit-proxy" $fullname }}
+    - {{ printf "%s-audit-proxy.%s" $fullname $ns }}
+    - {{ printf "%s-audit-proxy.%s.svc" $fullname $ns }}
+    - {{ printf "%s-audit-proxy.%s.svc.%s" $fullname $ns $domain }}
+  issuerRef:
+    {{- include "obp.internalIssuerRef" . | nindent 4 }}
+{{- end }}
+{{- end }}

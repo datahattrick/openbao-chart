@@ -1,0 +1,179 @@
+# Environment: Azure — auto-unseal with Azure Key Vault via Workload Identity.
+#
+#   helm upgrade --install openbao charts/openbao-platform -n openbao \
+#     -f charts/openbao-platform/values-prod.yaml \
+#     -f charts/openbao-platform/values-azure.yaml
+#
+# PREREQUISITES OUTSIDE THIS CHART
+#   1. A Key Vault and a key, with the workload's managed identity granted
+#      Key Vault Crypto User (wrapKey/unwrapKey/get) on it.
+#   2. A federated credential on that identity:
+#        issuer  = the AKS cluster's OIDC issuer URL
+#        subject = system:serviceaccount:<namespace>:<serviceaccount name>
+#        audience= api://AzureADTokenExchange
+#   3. The azure-workload-identity webhook installed in the cluster. It is what
+#      injects AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_FEDERATED_TOKEN_FILE /
+#      AZURE_AUTHORITY_HOST, and it only mutates pods carrying the
+#      `azure.workload.identity/use: "true"` label.
+
+bootstrap:
+  init:
+    # Mandatory with any seal. OpenBao issues RECOVERY keys instead of unseal
+    # keys, and the Job must not try to unseal a cluster that unseals itself.
+    # The render fails if this disagrees with the seal.
+    autoUnseal: true
+    # Recovery keys authorise recovery operations (generate-root, rekey). They
+    # do NOT unseal anything. Store them exactly as carefully as unseal keys —
+    # and note that losing the Key Vault key is unrecoverable regardless.
+    keyShares: 5
+    keyThreshold: 3
+
+openbao:
+  server:
+    # The webhook only mutates pods with this label.
+    extraLabels:
+      azure.workload.identity/use: "true"
+
+    serviceAccount:
+      create: true
+      annotations:
+        # The user-assigned managed identity's client ID.
+        azure.workload.identity/client-id: "CHANGEME-00000000-0000-0000-0000-000000000000"
+        # Optional; defaults to the cluster's tenant.
+        # azure.workload.identity/tenant-id: "..."
+
+    seal:
+      type: azurekeyvault
+      directory: /openbao/plugins
+      downloadBehavior: fail
+
+      azurekeyvault:
+        vaultName: CHANGEME-kv
+        keyName: openbao-unseal
+        # Federated OIDC — no client secret anywhere in the cluster.
+        # tenantId/clientId stay EMPTY: the webhook injects them, and setting
+        # them here would override what it injected.
+        authMethod: workload_identity
+        # environment: AZUREUSGOVERNMENT   # for sovereign clouds
+        # resource: vault.usgovcloudapi.net
+
+      plugin:
+        # Required from OpenBao v2.7.0, harmless before it: a plugin shadows
+        # the built-in of the same name, so registering it now makes the 2.7.0
+        # upgrade a no-op.
+        enabled: true
+        type: kms
+        name: azurekeyvault          # must equal seal.type to shadow the built-in
+
+        # ------------------------------------------------------------------
+        # DELIVERY — pick one. Both work without public internet.
+        # ------------------------------------------------------------------
+        #
+        # (a) source: oci  — OpenBao pulls the image itself and extracts the
+        #     binary, verifying sha256sum. Point `image` at your Artifactory
+        #     Docker repo. Fewest moving parts; no initContainer.
+        #
+        # (b) source: preloaded — an initContainer puts the binary in
+        #     `directory` first. Use when Artifactory serves the release
+        #     tarball from a GENERIC repo rather than as an OCI image, or when
+        #     egress from the OpenBao pod itself is not permitted. See
+        #     extraInitContainers below.
+        source: oci
+        # Upstream publishes a multi-arch index at
+        #   ghcr.io/openbao/openbao-plugin-kms-azure:v0.1.0
+        # Mirror that into Artifactory and point this at your copy.
+        image: CHANGEME-artifactory.example.com/openbao/openbao-plugin-kms-azure:v0.1.0
+
+        # Name inside the OCI image, and the installed name.
+        binaryName: openbao-plugin-kms-azure
+        command: openbao-plugin-kms-azure
+        # Name inside the release tarball — used only by the fetch
+        # initContainer below. Change the arch suffix for non-amd64 nodes and
+        # take the matching sha256sum line.
+        archiveBinary: openbao-plugin-kms-azure_linux_amd64_v1
+
+        # NOT OPTIONAL. OpenBao verifies the binary against this, which is what
+        # makes pulling from a mirror safe. Upstream value for
+        # kms-azure v0.1.0, linux/amd64 — re-derive it for any other
+        # version or architecture from checksums-kms-azure.txt on the release:
+        #   https://github.com/openbao/openbao-plugins/releases/tag/kms-azure-v0.1.0
+        sha256sum: e46a6d13ab427b594c89e58b002db6bbb6d61557f5de8a599557c76827deef0d
+
+    # The plugin directory must be a real, writable, non-symlink directory.
+    # An emptyDir is enough — the binary is re-fetched or re-extracted on every
+    # start, and sha256sum is verified each time.
+    volumes:
+      - name: tls-internal
+        secret: { secretName: openbao-tls-internal, defaultMode: 0400 }
+      - name: tls-server
+        secret: { secretName: openbao-tls-server, defaultMode: 0400 }
+      # init-keys is deliberately NOT mounted: bootstrap.keyOutput.mountIntoServer
+      # defaults to false so the keys are not readable by anyone who can exec
+      # into a pod. Add it back together with that flag if you want the
+      # extract-from-the-pod flow.
+      - name: plugins
+        emptyDir: {}
+      # Writable scratch for the fetch initContainer, which runs with
+      # readOnlyRootFilesystem.
+      - name: tmp
+        emptyDir: {}
+    volumeMounts:
+      - { name: tls-internal, mountPath: /openbao/tls/internal, readOnly: true }
+      - { name: tls-server,   mountPath: /openbao/tls/server,   readOnly: true }
+      - { name: plugins,      mountPath: /openbao/plugins }
+
+    # ----------------------------------------------------------------------
+    # DELIVERY (b): fetch from an Artifactory generic repo.
+    # Only needed when seal.plugin.source is `preloaded`. Leave commented out
+    # for source: oci.
+    #
+    # Rendered with tpl in the subchart's context, so it can read
+    # .Values.server.seal.* directly and cannot drift from the seal config.
+    # ----------------------------------------------------------------------
+    extraInitContainers: []
+    # - name: fetch-seal-plugin
+    #   image: docker.io/curlimages/curl:8.11.1
+    #   imagePullPolicy: IfNotPresent
+    #   securityContext:
+    #     allowPrivilegeEscalation: false
+    #     readOnlyRootFilesystem: true
+    #     capabilities: { drop: ["ALL"] }
+    #   resources:
+    #     requests: { cpu: 50m, memory: 64Mi }
+    #     limits:   { cpu: 500m, memory: 128Mi }
+    #   command: ["/bin/sh", "-ec"]
+    #   args:
+    #     - |
+    #       # Artifactory generic repo serving the upstream release tarball.
+    #       URL="CHANGEME-https://artifactory.example.com/artifactory/openbao/openbao-plugin-kms-azure_linux_amd64_v1.tar.gz"
+    #       WANT="{{ .Values.server.seal.plugin.sha256sum }}"
+    #       # ARCHIVE_BIN is the name in the tarball and in the checksum line;
+    #       # BIN is what OpenBao will look for. They differ upstream.
+    #       ARCHIVE_BIN="{{ .Values.server.seal.plugin.archiveBinary }}"
+    #       BIN="{{ .Values.server.seal.plugin.command | default .Values.server.seal.plugin.binaryName }}"
+    #       DIR="{{ .Values.server.seal.directory }}"
+    #
+    #       cd /tmp
+    #       # --cacert for a private CA; add -u for an Artifactory API key.
+    #       curl -fsSL ${ARTIFACTORY_CA:+--cacert $ARTIFACTORY_CA} \
+    #            ${ARTIFACTORY_TOKEN:+-H "Authorization: Bearer $ARTIFACTORY_TOKEN"} \
+    #            -o plugin.tar.gz "$URL"
+    #       tar xzf plugin.tar.gz
+    #
+    #       # Verify BEFORE installing. OpenBao checks this too, but failing
+    #       # here names the problem instead of surfacing it as a seal error.
+    #       echo "${WANT}  ${ARCHIVE_BIN}" | sha256sum -c - || {
+    #         echo "checksum mismatch: refusing to install the seal plugin" >&2
+    #         exit 1
+    #       }
+    #
+    #       install -m 0755 "$ARCHIVE_BIN" "${DIR}/${BIN}"
+    #       echo "installed ${DIR}/${BIN}"
+    #   env:
+    #     # - name: ARTIFACTORY_TOKEN
+    #     #   valueFrom: { secretKeyRef: { name: artifactory-creds, key: token } }
+    #     - name: HOME
+    #       value: /tmp
+    #   volumeMounts:
+    #     - { name: plugins, mountPath: /openbao/plugins }
+    #     - { name: tmp, mountPath: /tmp }
