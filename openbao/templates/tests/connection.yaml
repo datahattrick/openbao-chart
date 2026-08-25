@@ -14,12 +14,7 @@ metadata:
 spec:
   restartPolicy: Never
   {{- include "obp.priorityClassName" (dict "root" $ "component" dict) | nindent 2 }}
-  securityContext:
-    runAsNonRoot: true
-    runAsUser: 100
-    runAsGroup: 1000
-    seccompProfile:
-      type: RuntimeDefault
+  {{- include "obp.podSecurityContext" (dict "root" $ "uid" 100 "gid" 1000) | nindent 2 }}
   containers:
     - name: test
       image: "{{ ((index .Values "openbao").server.image).registry | default "quay.io" }}/{{ ((index .Values "openbao").server.image).repository | default "openbao/openbao" }}:{{ ((index .Values "openbao").server.image).tag | default (trimPrefix "v" .Chart.AppVersion) }}"
@@ -42,7 +37,7 @@ spec:
           value: /tmp
         - name: BAO_ADDR
           value: {{ include "obp.baoInternalAddr" . | quote }}
-        {{- if .Values.tls.enabled }}
+        {{- if include "obp.tlsEnabled" . }}
         - name: BAO_CACERT
           value: {{ include "obp.internalCaPath" . | quote }}
         {{- end }}
@@ -55,7 +50,7 @@ spec:
           bao status | grep -q "Storage Type.*raft" && echo "raft storage confirmed"
           echo "OK"
       volumeMounts:
-        {{- if .Values.tls.enabled }}
+        {{- if include "obp.tlsEnabled" . }}
         - name: tls-internal
           mountPath: {{ .Values.tls.internal.mountPath }}
           readOnly: true
@@ -63,7 +58,7 @@ spec:
         - name: tmp
           mountPath: /tmp
   volumes:
-    {{- if .Values.tls.enabled }}
+    {{- if include "obp.tlsEnabled" . }}
     - name: tls-internal
       secret:
         secretName: {{ include "obp.internalTlsSecret" . }}

@@ -1,5 +1,5 @@
 {{- include "obp.validate" . }}
-{{- if .Values.tls.enabled }}
+{{- if include "obp.tlsEnabled" . }}
 {{- $fullname := include "obp.baoFullname" . }}
 {{- $ns := include "obp.namespace" . }}
 {{- $domain := include "obp.clusterDomain" . }}
@@ -7,8 +7,9 @@
 {{- $replicas := int (include "obp.replicas" .) }}
 {{- $bao := index .Values "openbao" | default dict }}
 {{- $ha := (($bao.server).ha) | default dict }}
+{{- $beSource := .Values.tls.internal.source | default "cert-manager" }}
 ---
-{{- if .Values.tls.ca.create }}
+{{- if and .Values.tls.ca.create (eq $beSource "cert-manager") }}
 # =============================================================================
 # BACKEND trust domain
 # =============================================================================
@@ -68,12 +69,16 @@ spec:
   ca:
     secretName: {{ include "obp.caSecret" . }}
 {{- end }}
+{{- if eq $beSource "cert-manager" }}
 ---
 # The certificate the BACKEND listener (port {{ .Values.tls.internal.port }}) presents.
 #
 # Every name a peer, probe or in-cluster client may dial has to be in here. The
 # per-pod names matter most: retry_join addresses each peer by its stable
 # StatefulSet DNS name, and api_addr redirects use the same form.
+#
+# With tls.internal.source=secret this is not rendered: the Secret is yours, and
+# it has to carry ca.crt alongside tls.crt and tls.key.
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -141,7 +146,8 @@ spec:
 {{- end }}
   issuerRef:
     {{- include "obp.internalIssuerRef" . | nindent 4 }}
-{{- if .Values.tls.server.enabled }}
+{{- end }}
+{{- if and .Values.tls.server.enabled (eq (.Values.tls.server.source | default "cert-manager") "cert-manager") }}
 ---
 # =============================================================================
 # FRONTEND trust domain
@@ -150,6 +156,9 @@ spec:
 # presents. Issued by a DIFFERENT issuer, and carrying only public-facing names:
 # it is never valid for a peer address, so it cannot be used to join the raft
 # cluster even if the frontend CA is compromised.
+#
+# With tls.server.source=secret this is not rendered at all: the Secret is
+# yours, and the chart only mounts it.
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:

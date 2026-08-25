@@ -23,25 +23,28 @@ flowchart LR
     end
     bao -->|"file device<br/>declared first"| pvc[("PVC /openbao/audit<br/><i>durable, cannot fail</i>")]
     bao -->|"http device<br/>Content-Type: application/json"| proxy
-    subgraph proxy["audit proxy (Fluent Bit)"]
-        in["http input :9880"] --> buf[("filesystem buffer<br/>retry with backoff")] --> out["forward / http output"]
+    subgraph proxy["audit proxy (OpenTelemetry Collector)"]
+        in["webhook_event receiver<br/>TLS :9880"] --> buf[("persistent sending queue<br/>retry with backoff")] --> out["otlphttp exporter"]
     end
-    out --> sink[("Fluent Bit / VictoriaLogs")]
+    out --> sink[("any OTLP receiver<br/>VictoriaLogs, collector, ...")]
     bao -.->|"operational logs only —<br/>never audit records"| so
     so -.-> collector([node log collector])
     style so fill:#fee,stroke:#c44
 ```
 
-The proxy is a Fluent Bit deployment with an `http` input, filesystem buffering
-and retry. It exists rather than pointing OpenBao straight at your log
-aggregator because **the http audit device is synchronous and does not retry** —
-it is on OpenBao's request path. The proxy accepts in microseconds and deals
-with the downstream on its own.
+The proxy is an OpenTelemetry Collector (contrib) deployment: a `webhook_event`
+receiver for the audit device's POSTs, a `file_storage` sending queue, and an
+OTLP exporter. It sits between OpenBao and your log store because **the http
+audit device is synchronous and does not retry**, on OpenBao's request path. The
+proxy accepts in ~2ms and deals with the downstream itself.
 
-There is deliberately **no `stdout` output plugin** in the generated Fluent Bit
-config, and this chart will not render one. `auditProxy.logLevel` controls
-Fluent Bit's own diagnostics, never record payloads. The pod also carries the
-common collector-exclusion annotations as a second line of defence.
+The generated config has **no `debug` or `file` exporter**, and this chart will
+not render one. `auditProxy.logLevel` sets the collector's own diagnostic level,
+never record payloads. The pod also carries the common collector-exclusion
+annotations as a second line of defence.
+
+The contrib distribution is required: `webhook_event` is not in the core
+collector.
 
 ## Declarative, not API-managed
 
@@ -70,7 +73,7 @@ Consequences:
 `elide_list_responses` is on: list responses can name thousands of secrets, so
 eliding them cuts both volume and a real information-leak surface.
 
-## Two failure modes that will cost you an afternoon
+## Four failure modes that will cost you an afternoon
 
 ### 1. A failed audit device makes the cluster unrecoverable
 
@@ -122,7 +125,8 @@ It **replaces** the request headers with whatever `headers` is configured to,
 rather than adding to them. With no `headers` option, the POST goes out with no
 `Content-Type` at all.
 
-Fluent Bit's http input is strict about it:
+Receivers reject that. Measured against Fluent Bit's http input, which the proxy
+used before the collector:
 
 | Content-Type | Result |
 |---|---|
@@ -145,19 +149,59 @@ fails with:
 ```
 
 Nothing is lost — records buffer and retry — but nothing arrives, and the only
-clue is in the proxy's own log. Set:
+clue is in the proxy's own log.
+
+This chart does not write the fix for you: the policy belongs in the sink's
+namespace, and whoever deploys OpenBao usually neither knows that namespace's
+layout nor controls it. Ask its owner for an ingress rule admitting the audit
+proxy on the sink port — the proxy's pods carry
+`app.kubernetes.io/component: audit-proxy` and the release's
+`app.kubernetes.io/instance` label:
 
 ```yaml
-auditProxy:
-  output:
-    downstreamNetworkPolicy:
-      enabled: true
-      namespace: monitoring
+ingress:
+  - from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: openbao
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/instance: openbao
+            app.kubernetes.io/component: audit-proxy
+    ports:
+      - port: 24224
+        protocol: TCP
 ```
 
-which creates a NetworkPolicy **in that namespace** admitting just the audit
-proxy on just the sink port. Off by default, because writing into someone else's
-namespace should be a deliberate choice.
+### 4. Why the proxy is not Fluent Bit
+
+`auditProxy.tls.enabled` defaults on, and the hop works, because the proxy is an
+OpenTelemetry Collector. Fluent Bit could not do this job. Measured on one
+machine, same certificate, same client, POSTing an audit-shaped record:
+
+| Proxy | TLS handshake | Total per POST |
+|---|---:|---:|
+| Fluent Bit 4.0.5 | 502ms | **1002ms** |
+| otelcol-contrib 0.159.0 | 2.4ms | **2.5ms** |
+| Vector 0.51.0 | 1.6ms | **1.8ms** |
+
+Fluent Bit's numbers do not move with four times the CPU, so they are event-loop
+constants. The http audit device is synchronous and inherits the context of the
+request being audited, so at ~1s per POST every audit write failed:
+
+```
+backend failed to log request  backend=http/
+  error: failed to perform request: Post "https://…/openbao.audit": context canceled
+```
+
+and the audited calls stalled with them: `bao audit list` and the autopilot write
+both timed out on a live cluster.
+
+Trust is a separate matter and is handled. The http audit device takes no CA
+option, so OpenBao validates the hop against its process trust store;
+`openbao.server.extraEnvironmentVars` sets `SSL_CERT_DIR` to the backend CA's
+mount, and Go adds that directory to the system roots, so public CAs keep working
+for the seal and GitLab OIDC.
 
 ## Running the proxy as a sidecar instead
 
@@ -175,13 +219,13 @@ openbao:
         host: 127.0.0.1
     extraContainers:
       - name: audit-proxy
-        image: docker.io/fluent/fluent-bit:4.0.5
-        args: ["--config=/fluent-bit/etc/fluent-bit.conf"]
+        image: docker.io/otel/opentelemetry-collector-contrib:0.159.0
+        args: ["--config=/etc/otelcol/config.yaml"]
         resources:
-          requests: {cpu: 50m, memory: 64Mi}
-          limits:   {cpu: 500m, memory: 256Mi}
+          requests: {cpu: 50m, memory: 128Mi}
+          limits:   {cpu: 500m, memory: 512Mi}
         volumeMounts:
-          - {name: audit-proxy-config, mountPath: /fluent-bit/etc/fluent-bit.conf, subPath: fluent-bit.conf}
+          - {name: audit-proxy-config, mountPath: /etc/otelcol/config.yaml, subPath: config.yaml}
 ```
 
 Trade-off: one proxy per replica, no aggregation, and you supply the ConfigMap.

@@ -7,7 +7,7 @@
   release {{ .Release.Name }} in namespace {{ $ns }}
 
 TRUST DOMAINS
-{{ if .Values.tls.enabled }}
+{{ if include "obp.tlsEnabled" . }}
   backend  :{{ .Values.tls.internal.port }}  {{ if .Values.tls.ca.create }}CA created by this chart (Issuer/{{ $fullname }}-backend-ca){{ else }}{{ .Values.tls.internal.issuerRef.kind }}/{{ .Values.tls.internal.issuerRef.name }}{{ end }}
              raft join, request forwarding, probes, snapshot agent, metrics
 {{- if .Values.tls.server.enabled }}
@@ -83,8 +83,14 @@ AUDIT   (declared in the config file; applied on startup and SIGHUP)
   !! OpenBao stops serving requests.
 {{- end }}
 {{- if ($ad.http).enabled }}
-  http -> {{ $fullname }}-audit-proxy:{{ .Values.auditProxy.listen.port }} -> {{ .Values.auditProxy.output.type }}{{ if eq .Values.auditProxy.output.type "forward" }} {{ .Values.auditProxy.output.forward.host }}:{{ .Values.auditProxy.output.forward.port }}{{ else if eq .Values.auditProxy.output.type "http" }} {{ .Values.auditProxy.output.http.host }}:{{ .Values.auditProxy.output.http.port }}{{ end }}
+  http -> {{ $fullname }}-audit-proxy:{{ .Values.auditProxy.listen.port }} -> {{ .Values.auditProxy.output.type }}{{ if eq .Values.auditProxy.output.type "otlphttp" }} {{ .Values.auditProxy.output.otlphttp.endpoint }}{{ else if eq .Values.auditProxy.output.type "otlp" }} {{ .Values.auditProxy.output.otlp.endpoint }}{{ end }}
+{{- if .Values.auditProxy.output.debug }}
+  !! auditProxy.output.debug is ON: every audit record is also printed to the
+  !! audit proxy's stdout, where the node log collector will pick it up.
+  !! Development only.
+{{- else }}
   Audit records are never written to a container's stdout.
+{{- end }}
   NOTE: the http device is created at startup, so OpenBao will not start while
   the audit proxy is unreachable.
 {{- end }}

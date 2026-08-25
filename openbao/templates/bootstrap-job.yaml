@@ -55,13 +55,7 @@ spec:
       restartPolicy: {{ .Values.bootstrap.restartPolicy }}
       serviceAccountName: {{ $sa }}
       {{- include "obp.priorityClassName" (dict "root" $ "component" .Values.bootstrap) | nindent 6 }}
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 100
-        runAsGroup: 1000
-        fsGroup: 1000
-        seccompProfile:
-          type: RuntimeDefault
+      {{- include "obp.podSecurityContext" (dict "root" $ "uid" 100 "gid" 1000) | nindent 6 }}
       {{- with .Values.bootstrap.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -132,7 +126,7 @@ spec:
               value: {{ include "obp.replicas" . | quote }}
             - name: BAO_PORT
               value: {{ .Values.tls.internal.port | quote }}
-            {{- if .Values.tls.enabled }}
+            {{- if include "obp.tlsEnabled" . }}
             - name: BAO_CACERT
               value: {{ include "obp.internalCaPath" . | quote }}
             {{- end }}
@@ -188,7 +182,14 @@ spec:
             - name: AUDIT_HTTP_ENABLED
               value: {{ (($ad.http).enabled) | default false | quote }}
             - name: AUDIT_HTTP_URL
-              value: {{ printf "http://%s:%v/%s" (($ad.http).host | default (printf "%s-audit-proxy.%s.svc" $fullname $ns)) ((($ad.http).port) | default 9880) ((($ad.http).uriPath) | default "openbao.audit") | quote }}
+              value: {{ printf "%s://%s:%v/%s" (ternary "https" "http" (($ad.http).tls | default false)) (($ad.http).host | default (printf "%s-audit-proxy.%s.svc" $fullname $ns)) ((($ad.http).port) | default 9880) ((($ad.http).uriPath) | default "openbao.audit") | quote }}
+            # Verifies the pre-flight against the same CA OpenBao will use.
+            - name: AUDIT_CA_CERT
+{{- if and (($ad.http).tls | default false) (include "obp.tlsEnabled" .) }}
+              value: {{ include "obp.internalCaPath" . | quote }}
+{{- else }}
+              value: ""
+{{- end }}
             - name: AUDIT_WAIT_TIMEOUT
               value: {{ .Values.bootstrap.auditWaitTimeoutSeconds | default 180 | quote }}
 
@@ -235,7 +236,7 @@ spec:
             - name: bootstrap
               mountPath: /bootstrap
               readOnly: true
-            {{- if .Values.tls.enabled }}
+            {{- if include "obp.tlsEnabled" . }}
             - name: tls-internal
               mountPath: {{ .Values.tls.internal.mountPath }}
               readOnly: true
@@ -256,7 +257,7 @@ spec:
           configMap:
             name: {{ $fullname }}-bootstrap
             defaultMode: 0555
-        {{- if .Values.tls.enabled }}
+        {{- if include "obp.tlsEnabled" . }}
         - name: tls-internal
           secret:
             secretName: {{ include "obp.internalTlsSecret" . }}

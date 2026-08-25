@@ -1,8 +1,8 @@
 # Environment: Azure — auto-unseal with Azure Key Vault via Workload Identity.
 #
-#   helm upgrade --install openbao charts/openbao-platform -n openbao \
-#     -f charts/openbao-platform/values-prod.yaml \
-#     -f charts/openbao-platform/values-azure.yaml
+#   helm upgrade --install openbao openbao/ -n openbao \
+#     -f openbao/examples/values-prod.yaml \
+#     -f openbao/examples/values-azure.yaml
 #
 # PREREQUISITES OUTSIDE THIS CHART
 #   1. A Key Vault and a key, with the workload's managed identity granted

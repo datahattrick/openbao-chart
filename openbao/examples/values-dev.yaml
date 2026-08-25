@@ -40,3 +40,9 @@ openbao:
         memory: 512Mi
     # A single-node cluster cannot satisfy a required pod anti-affinity.
     affinity: {}
+
+# Print every audit record to the audit proxy's stdout, so the pipeline can be
+# watched with `kubectl logs`. Refused outside development.
+auditProxy:
+  output:
+    debug: true

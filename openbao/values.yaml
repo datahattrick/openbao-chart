@@ -1,0 +1,1380 @@
+# =============================================================================
+# openbao
+# =============================================================================
+# Everything under `openbao:` is passed to the subchart; every other top-level
+# key belongs to this chart. See docs/ARCHITECTURE.md before changing the TLS or
+# listener settings — several values must agree with the raft HCL at the bottom.
+# =============================================================================
+
+# Helm globals. Propagate to the subchart, and keep propagating if this chart is
+# itself a dependency of your own umbrella.
+global:
+  # false: vanilla Kubernetes — pods pin uid 100 / gid 1000 / fsGroup 1000.
+  # true:  OpenShift — pods pin no ids, so the SCC assigns them.
+  # Set it here or at the top of your umbrella; do NOT try to clear the ids with
+  # a map override, Helm merges maps key by key and an empty one clears nothing.
+  openshift: false
+
+  # The chart-wide TLS switch, and the subchart's own spelling of it, so both
+  # read one value. true serves plaintext, and then
+  # openbao.server.ha.raft.config must be replaced with plaintext listeners —
+  # the render fails if it still names certificate files.
+  tlsDisable: false
+
+# Only change if your kubelet uses a non-default --cluster-domain.
+clusterDomain: cluster.local
+
+# PriorityClass for every workload this chart creates; per-component overrides
+# live under bootstrap/auditProxy/snapshotAgent/restore. The OpenBao
+# StatefulSet reads openbao.server.priorityClassName instead, and the render
+# fails if this is set and that one is not.
+priorityClassName: ""
+
+deployment:
+  # development | production. With a debug log level and
+  # bootstrap.keyOutput.revealWhenDebug, development prints the unseal keys and
+  # root token to the bootstrap Job log.
+  environment: production
+
+# -----------------------------------------------------------------------------
+# Namespace
+# -----------------------------------------------------------------------------
+# create: true makes the namespace WITH the Pod Security labels below — do not
+# also pass --create-namespace. false means you create it yourself. On OpenShift
+# the labels are ignored in favour of SCCs.
+namespace:
+  create: false
+  # Applied only when create is true.
+  podSecurity:
+    enforce: restricted
+    audit: restricted
+    warn: restricted
+  labels: {}
+  annotations: {}
+
+# -----------------------------------------------------------------------------
+# TLS — two trust domains
+# -----------------------------------------------------------------------------
+# BACKEND ("internal"), port 8200: raft join, forwarding, service registration,
+#   probes, snapshot agent, in-cluster clients. Its CA is the only CA a raft
+#   join accepts.
+# FRONTEND ("server"), port 8210: ingress traffic only, issued by a different
+#   Issuer.
+# The cluster port (8201) uses certificates OpenBao generates itself;
+# cert-manager neither can nor should issue those. See docs/ARCHITECTURE.md.
+# TLS is on unless global.tlsDisable is set; everything below configures it.
+tls:
+  # A namespace-local CA that anchors the BACKEND trust domain.
+  ca:
+    # Ignored when tls.internal.source is `secret`, which brings its own CA.
+    create: true
+    secretName: openbao-backend-ca
+    commonName: ""            # default: "<fullname> backend CA"
+    duration: 87600h          # 10 years
+    renewBefore: 720h         # 30 days
+    privateKey:
+      algorithm: ECDSA
+      size: 384
+    selfSignedIssuerName: ""  # default: <fullname>-selfsigned
+
+  internal:
+    # Port for the backend listener. Also the cluster's api_addr port.
+    port: 8200
+    # Cluster (raft/request-forwarding) port.
+    clusterPort: 8201
+    mountPath: /openbao/tls/internal
+
+    # Where the backend certificate comes from.
+    #
+    #   cert-manager  This chart creates the CA (tls.ca) and the leaf, with
+    #                 every peer, service and per-pod name in the SANs.
+    #   secret        You supply the Secret and the chart only mounts it. The
+    #                 tls.ca block above is not rendered, and issuerRef,
+    #                 duration, renewBefore, privateKey, extraDnsNames and
+    #                 extraIpAddresses are unused.
+    #
+    # Under `secret` the Secret MUST carry ca.crt as well as tls.crt and
+    # tls.key: raft joins validate peers against
+    # <mountPath>/ca.crt (leader_ca_cert_file), and the bootstrap Job, snapshot
+    # agent, restore Job and helm test all read it as BAO_CACERT.
+    #
+    # The certificate MUST cover every name a peer or probe dials, or the
+    # cluster does not form:
+    #   <release>-<N>.<release>-internal.<ns>.svc[.<clusterDomain>]  per replica
+    #   <release>[-internal|-active|-standby][.<ns>[.svc[.<clusterDomain>]]]
+    #   localhost, 127.0.0.1, ::1
+    # See the dnsNames list in templates/pki.yaml for the exact set the
+    # cert-manager path issues.
+    source: cert-manager
+
+    # cert-manager writes here; with source=secret this names YOUR Secret.
+    # openbao.server.volumes must mount this same name.
+    secretName: openbao-tls-internal
+
+    # source=cert-manager only. Leave empty to use the CA this chart creates.
+    issuerRef:
+      name: ""
+      kind: Issuer
+      group: cert-manager.io
+    duration: 2160h           # 90 days
+    renewBefore: 720h         # 30 days
+    privateKey:
+      algorithm: ECDSA
+      size: 256
+      rotationPolicy: Always
+    # Extra SANs beyond the pod/service names this chart computes.
+    extraDnsNames: []
+    extraIpAddresses: []
+    # Require client certificates from the backend CA on port 8200. Every
+    # in-cluster client then needs one; enable only after auditing all of them.
+    mutualTls: false
+
+  server:
+    # The frontend listener. Off means a single-trust-domain install. Turning it
+    # on also needs an `https-frontend` entry in openbao.server.extraPorts, and
+    # whatever `source` below requires; the render fails naming what is missing.
+    enabled: false
+    port: 8210
+    mountPath: /openbao/tls/server
+
+    # Where the frontend certificate comes from.
+    #
+    #   cert-manager  This chart creates a Certificate from issuerRef, and
+    #                 cert-manager writes it to secretName. Needs issuerRef.name
+    #                 and dnsNames.
+    #   secret        You supply the Secret yourself and the chart only mounts
+    #                 it. Nothing here is issued or renewed, and issuerRef,
+    #                 dnsNames, duration, renewBefore and privateKey are unused.
+    #                 For clusters without cert-manager, or a certificate your
+    #                 corporate CA issues out of band.
+    source: cert-manager
+
+    # cert-manager writes here; with source=secret this names YOUR Secret.
+    # Either way it must be a kubernetes.io/tls Secret (tls.crt + tls.key) in
+    # this namespace, and openbao.server.volumes must mount this same name —
+    # the render fails if it does not.
+    secretName: openbao-tls-server
+
+    # source=cert-manager only. A DIFFERENT issuer from the backend CA — that is
+    # the entire point.
+    issuerRef:
+      name: ""
+      kind: ClusterIssuer
+      group: cert-manager.io
+    # Hostnames clients use. Must include the Ingress/Route host.
+    dnsNames: []
+    ipAddresses: []
+    duration: 2160h
+    renewBefore: 720h
+    privateKey:
+      algorithm: ECDSA
+      size: 256
+      rotationPolicy: Always
+
+# -----------------------------------------------------------------------------
+# Bootstrap
+# -----------------------------------------------------------------------------
+# A single-completion Job that initialises and unseals the cluster and applies
+# audit, auth and policy config. Guarded by `bao status`, so a re-run against an
+# initialised cluster reconfigures rather than re-initialises.
+bootstrap:
+  enabled: true
+
+  # Runs the `bao` CLI. Empty fields inherit the server image.
+  image:
+    registry: ""              # default: openbao.server.image.registry
+    repository: ""            # default: openbao.server.image.repository
+    tag: ""                   # default: openbao.server.image.tag / appVersion
+    pullPolicy: IfNotPresent
+
+  # Writes the keys and tokens into a Secret.
+  kubectlImage:
+    registry: docker.io
+    repository: alpine/kubectl
+    tag: "1.34.1"
+    pullPolicy: IfNotPresent
+
+  # Run as a Helm post-install/post-upgrade hook instead of a plain Job. Hook
+  # Jobs are invisible to ArgoCD/Flux drift detection and their logs are deleted
+  # on the next release.
+  hook:
+    enabled: false
+    weight: 5
+    deletePolicy: before-hook-creation
+
+  backoffLimit: 6
+  activeDeadlineSeconds: 1800
+  # null keeps finished Job pods and their logs; a number of seconds reaps them.
+  ttlSecondsAfterFinished: null
+  restartPolicy: OnFailure
+
+  # How long to wait for the first server pod to answer before giving up.
+  waitTimeoutSeconds: 300
+  # Per-node budget for each follower to appear. Unsealing node N is what brings
+  # node N+1 into existence, so this is paid once per replica.
+  nodeWaitTimeoutSeconds: 300
+  # How long the audit endpoint has to accept a test record before the Job
+  # refuses to initialise.
+  auditWaitTimeoutSeconds: 180
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
+
+  initResources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  annotations: {}
+  podAnnotations: {}
+  # Overrides the top-level priorityClassName.
+  priorityClassName: ""
+
+  serviceAccount:
+    create: true
+    # default: <fullname>-bootstrap
+    name: ""                  
+    annotations: {}
+
+  init:
+    keyShares: 5
+    keyThreshold: 3
+    # Required when openbao.server.seal.type is set: OpenBao then issues
+    # RECOVERY keys and the Job must not try to unseal. The render fails if the
+    # two disagree.
+    autoUnseal: false
+    # Extra flags appended to `bao operator init`.
+    extraArgs: []
+
+  unseal:
+    # Unseal every replica after init. Ignored when init.autoUnseal is true.
+    enabled: true
+
+  keyOutput:
+    secretName: openbao-init-keys
+    labels: {}
+    annotations: {}
+
+    # Mount the key Secret read-only into the server pods, so the keys are files
+    # you can read and then destroy. While on, anyone who can exec into an
+    # OpenBao pod can read the unseal keys. Requires a matching `init-keys` entry
+    # in openbao.server.volumes/volumeMounts; the render fails on a half-set
+    # pair.
+    mountIntoServer: false
+    mountPath: /openbao/init-keys
+    # Third condition on the reveal gate: false keeps keys out of the Job log
+    # even in development at debug level.
+    revealWhenDebug: true
+
+  # Raft autopilot, applied through the API rather than the config file.
+  autopilot:
+    enabled: true
+    cleanupDeadServers: true
+    deadServerLastContactThreshold: 10m
+    serverStabilizationTime: 30s
+    # Sent only when replicas >= 3.
+    minQuorum: 3
+
+  # Revoke the initial root token once auth, policies and roles exist. The
+  # `root-token` entry is then deleted from the init Secret and replaced with a
+  # `root-token-revoked` marker. Mint a new one with `bao operator generate-root`
+  # and the unseal keys; requires generateRootEndpoints.backend, and the render
+  # fails if that is off.
+  revokeRootToken: true
+
+  # ---------------------------------------------------------------------------
+  # JWT/OIDC auth for Kubernetes service accounts
+  # ---------------------------------------------------------------------------
+  # The JWT auth method against the cluster's own OIDC issuer, not the
+  # Kubernetes auth method: no TokenReview call and no egress. Note that JWT
+  # auth only validates signatures, so a token revoked in Kubernetes stays valid
+  # here until it expires — keep the TTLs short. See docs/AUTH.md.
+  kubernetesAuth:
+    enabled: true
+    path: kubernetes
+    # Audience stamped into the projected tokens and enforced by
+    # bound_audiences. Keep it off the default API server audience so the token
+    # cannot be replayed against the Kubernetes API.
+    # KEEP IN SYNC with snapshotAgent.auth.audience
+    audience: openbao
+    # Static issuer URL to pin bound_issuer. Empty accepts whatever discovery
+    # returns.
+    boundIssuer: ""
+    # in-cluster | jwks
+    #   in-cluster  OpenBao discovers the issuer with its own token and CA. No
+    #               extra RBAC, no egress. Correct in an airgap.
+    #   jwks        Reads /openid/v1/jwks directly, which usually requires
+    #               binding system:service-account-issuer-discovery to
+    #               system:unauthenticated. Use only if in-cluster fails.
+    discovery: in-cluster
+
+  # The backup service account's OIDC identity and its policy.
+  snapshot:
+    enabled: true
+    role: bao-snapshot
+    policyName: raft-snapshot
+    tokenTtl: 30m
+    tokenMaxTtl: 1h
+
+  # ---------------------------------------------------------------------------
+  # GitLab CI/CD OIDC, for OpenTofu
+  # ---------------------------------------------------------------------------
+  # Lets a pipeline exchange a short-lived ID token for an OpenBao token, so CI
+  # holds no long-lived credential. Pipeline snippet in docs/AUTH.md.
+  gitlab:
+    enabled: false
+    path: gitlab
+    # Base URL of the GitLab instance. The only auth mount that talks outside
+    # the cluster.
+    url: ""                   # e.g. https://gitlab.example.com
+    # Defaults to url when empty.
+    boundIssuer: ""
+    # Must match `aud` in the pipeline's id_tokens block.
+    audience: ""              # e.g. https://openbao.example.com
+    # PEM CA bundle for a GitLab served by a private CA, inline or by ConfigMap.
+    caPem: ""
+    caConfigMap:
+      name: ""
+      key: ca.crt
+    # Policies created before the roles that reference them.
+    # policies:
+    #   opentofu: |
+    #     path "sys/mounts/*"        { capabilities = ["create","read","update","delete","list","sudo"] }
+    #     path "sys/policies/acl/*"  { capabilities = ["create","read","update","delete","list"] }
+    #     path "auth/*"              { capabilities = ["create","read","update","delete","list","sudo"] }
+    #     path "kv/*"                { capabilities = ["create","read","update","delete","list"] }
+    policies: {}
+    # WITHOUT bound_claims any pipeline on the instance can assume the role.
+    # Bind at least project_path; add ref and ref_protected for a writing role.
+    # roles:
+    #   - name: opentofu
+    #     policies: [opentofu]
+    #     tokenTtl: 30m
+    #     tokenMaxTtl: 1h
+    #     userClaim: project_path
+    #     boundClaims:
+    #       project_path: platform/openbao-config
+    #       ref: main
+    #       ref_type: branch
+    #       ref_protected: "true"
+    roles: []
+
+  # Token used to re-run configuration after the init Secret is destroyed. Needs
+  # privilege to write policies and auth mounts; takes precedence over the
+  # stored root token.
+  tokenSecret:
+    name: ""
+    key: token
+
+  # Extra ACL policies applied on every run, as name -> HCL.
+  policies: {}
+
+  # Raw `bao` commands appended to the script, run with the root token still
+  # exported. Templated with tpl.
+  extraCommands: ""
+
+# -----------------------------------------------------------------------------
+# External access
+# -----------------------------------------------------------------------------
+# Both of these target the FRONTEND listener (tls.server.port), never 8200.
+# Enable at most one.
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  path: /
+  pathType: Prefix
+  annotations: {}
+  labels: {}
+  # TLS between the client and the ingress controller. Separate from, and
+  # usually issued by the same CA as, tls.server.
+  tls:
+    enabled: false
+    secretName: ""
+  # The backend speaks HTTPS, so the controller must re-encrypt rather than send
+  # plaintext to 8210. On a non-Traefik controller set the equivalent
+  # annotations under `annotations` instead.
+  traefik:
+    # Adds the Traefik annotations for an HTTPS backend and creates a
+    # ServersTransport trusting the frontend CA.
+    serversTransport:
+      enabled: false
+      name: ""                # default: <fullname>-frontend
+      insecureSkipVerify: false
+      # Defaults to the ca.crt inside the frontend certificate's Secret.
+      rootCAsSecretName: ""
+
+# OpenShift Route. Ignored on vanilla Kubernetes.
+route:
+  enabled: false
+  host: ""
+  labels: {}
+  annotations: {}
+  # passthrough  The router forwards the TLS stream untouched and OpenBao
+  #              terminates it, so the frontend certificate is what clients
+  #              see and client-certificate auth survives. The router needs no
+  #              certificate of its own.
+  # reencrypt    The router terminates and opens a second TLS leg to 8210. It
+  #              then needs destinationCACertificate to trust what OpenBao
+  #              presents there.
+  termination: passthrough
+  insecureEdgeTerminationPolicy: Redirect
+  # reencrypt only, and required for it: the CA the router validates 8210
+  # against. Nothing fills this in for you — paste the frontend CA. Left empty,
+  # OpenShift falls back to the service CA, which will not match.
+  destinationCACertificate: ""
+
+# -----------------------------------------------------------------------------
+# NetworkPolicy
+# -----------------------------------------------------------------------------
+# Egress is open by default; OpenBao needs DNS, the Kubernetes API, S3 and
+# possibly GitLab. Close it with egress.enabled once you know your endpoints.
+networkPolicy:
+  enabled: true
+  # Deny all ingress to the namespace by default, then re-allow below.
+  defaultDenyIngress: true
+  # Pods in this namespace may talk to each other — required for raft.
+  allowSameNamespace: true
+  # Namespaces whose pods may reach the API/frontend listeners.
+  allowFromNamespaces:
+    - kube-system
+  # Extra namespace labels allowed to scrape metrics.
+  monitoring:
+    enabled: true
+    namespace: monitoring
+  egress:
+    enabled: false
+    rules: []
+
+# -----------------------------------------------------------------------------
+# Raft snapshots
+# -----------------------------------------------------------------------------
+# This chart's own CronJob; the subchart's exposes only `schedule`, so it cannot
+# set concurrencyPolicy. Keep openbao.snapshotAgent.enabled false.
+snapshotAgent:
+  enabled: false
+
+  # Each snapshot is a full copy of the store; tune to your RPO.
+  schedule: "0 2 * * *"
+  # IANA name, e.g. "Pacific/Auckland". Empty uses the
+  # kube-controller-manager's zone, usually UTC.
+  timeZone: ""
+
+  # Forbid stops a snapshot whose upload overruns from having a second one
+  # started beside it.
+  concurrencyPolicy: Forbid
+  # Skip a missed run rather than stampede when the controller recovers.
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # Retries per run, then it waits for the next schedule.
+  backoffLimit: 2
+  activeDeadlineSeconds: 3600
+  restartPolicy: OnFailure
+  suspend: false
+
+  image:
+    registry: ghcr.io
+    repository: openbao/openbao-snapshot-agent
+    tag: "0.4.1"
+    pullPolicy: IfNotPresent
+
+  serviceAccount:
+    create: true
+    name: ""                  # default: <fullname>-snapshot
+    annotations: {}
+
+  auth:
+    # KEEP IN SYNC with bootstrap.kubernetesAuth.path
+    path: kubernetes
+    # KEEP IN SYNC with bootstrap.snapshot.role
+    role: bao-snapshot
+    # KEEP IN SYNC with bootstrap.kubernetesAuth.audience
+    audience: openbao
+    tokenPath: /var/run/secrets/openbao/token
+    tokenExpirationSeconds: 600
+
+  s3:
+    host: ""
+    # s3cmd's --host-bucket. Path-style access needs the BARE HOST here;
+    # vhost-style needs `%(bucket)s.<host>`. Wrong either way reads as
+    # "403 AccessDenied: Invalid signature", not as a bad hostname.
+    bucket: ""
+    uri: ""
+    expireDays: "30"
+    extraFlags: ""
+    # Secret with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+    credentialsSecret: ""
+    # Or read them from OpenBao instead.
+    baoSecretPath: ""
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+  extraEnv: {}
+  nodeSelector: {}
+  tolerations: []
+  annotations: {}
+  podAnnotations: {}
+  priorityClassName: ""
+
+# -----------------------------------------------------------------------------
+# Audit log forwarding
+# -----------------------------------------------------------------------------
+#   OpenBao ──file device──> /openbao/audit/audit.log   (PVC, system of record)
+#           └─http device──> audit proxy :9880 ──OTLP──> your log store
+#
+# An OpenTelemetry Collector. It accepts the audit device's POSTs, buffers them
+# on disk, and exports OTLP to any compliant receiver. The device is synchronous
+# and does not retry, so the proxy is what makes a downstream outage survivable.
+#
+# Enable it together with openbao.server.auditDevices.http; the render fails on
+# only one of the two. See docs/AUDIT.md.
+auditProxy:
+  enabled: false
+
+  # A Deployment. It can also run as a sidecar on 127.0.0.1 so audit records
+  # never touch the pod network — see docs/AUDIT.md.
+  replicaCount: 2
+
+  # opentelemetry-collector-contrib. The webhook_event receiver is a contrib
+  # component, so the core distribution will not do.
+  image:
+    registry: docker.io
+    repository: otel/opentelemetry-collector-contrib
+    tag: "0.159.0"
+    pullPolicy: IfNotPresent
+
+  # Where OpenBao POSTs audit events. `path` becomes the receiver's URL path.
+  # KEEP IN SYNC with openbao.server.auditDevices.http.uriPath.
+  listen:
+    port: 9880
+    path: openbao.audit
+
+  # health_check extension, used by the probes and published on the Service.
+  healthPort: 13133
+
+  # Persistent sending queue, so a downstream outage costs shipping latency
+  # instead of records. Backed by an emptyDir: the durable copy is the file
+  # device on the audit PVC, so this need not survive a node failure.
+  buffer:
+    enabled: true
+    sizeLimit: 1Gi
+    # Batches held before the exporter starts refusing new ones.
+    queueSize: 10000
+
+  # Downstream sink.
+  output:
+    # otlphttp | otlp | none
+    #   otlphttp  OTLP over HTTP. `endpoint` is the FULL logs URL.
+    #   otlp      OTLP over gRPC. `endpoint` is host:port.
+    #   none      Accept and buffer without exporting. For testing the
+    #             OpenBao -> proxy hop on its own.
+    type: otlphttp
+
+    # DEVELOPMENT ONLY. Also prints every audit record to the proxy's stdout,
+    # for testing the pipeline end to end. The render fails unless
+    # deployment.environment is `development`, since stdout is collected off the
+    # node into a general-purpose log store. examples/values-dev.yaml sets it.
+    debug: false
+
+    otlphttp:
+      # e.g. http://vlogs.monitoring.svc.cluster.local:9428/insert/opentelemetry/v1/logs
+      endpoint: ""
+      headers: {}
+      # Existing Secret with an `authorization` entry, sent as that header.
+      headerSecret: ""
+      tls:
+        # true skips verification. Prefer caSecretName.
+        insecure: false
+        # Secret with ca.crt used to verify the downstream.
+        caSecretName: ""
+
+    otlp:
+      endpoint: ""              # host:port
+      headers: {}
+      headerSecret: ""
+      tls:
+        insecure: false
+        caSecretName: ""
+
+  # Attributes added to every record, so the downstream can route audit data to
+  # storage with tighter access control than ordinary application logs.
+  resourceAttributes:
+    log_source: openbao-audit
+
+  # The collector's own diagnostic level: debug | info | warn | error. Never
+  # contains audit records; no exporter writes them to stdout and this chart
+  # will not render one.
+  logLevel: info
+
+  # Annotations that keep the proxy's own stdout out of the cluster log
+  # collector. Add your own below if your collector uses a different key.
+  excludeFromLogCollection: true
+  podAnnotations: {}
+
+  # TLS on the OpenBao -> proxy hop.
+  # KEEP IN SYNC with openbao.server.auditDevices.http.tls; the render fails if
+  # they disagree, because one side would speak plaintext to a TLS listener.
+  #
+  # The http audit device takes no CA option, so OpenBao validates this hop
+  # against its process trust store. openbao.server.extraEnvironmentVars sets
+  # SSL_CERT_DIR to the backend CA's mount, which Go ADDS to the system roots,
+  # so public CAs keep working for the seal and GitLab OIDC.
+  tls:
+    enabled: true
+    # Issued by the BACKEND CA — the proxy is a backend component. Requires
+    # tls.internal.source=cert-manager.
+    secretName: ""                # default: <fullname>-audit-proxy-tls
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  annotations: {}
+  priorityClassName: ""
+
+  serviceAccount:
+    create: true
+    name: ""
+
+  # Replaces the generated config.yaml wholesale, e.g. to run a different
+  # collector distribution. Templated with tpl.
+  configOverride: ""
+
+# =============================================================================
+# Subchart: openbao
+# =============================================================================
+# The official chart's values namespace. Helm resolves these before any template
+# runs, so nothing here can be computed from the values above — keys the two
+# charts share are marked KEEP IN SYNC and _validate.tpl fails the render on a
+# mismatch. The exceptions are the keys the subchart itself runs through `tpl`
+# (ha.raft.config, extraContainers, statefulSet.securityContext, affinity,
+# nodeSelector, tolerations): those may hold template strings, evaluated in the
+# SUBCHART's context, where `.Values` is this `openbao:` block and
+# `.Values.global` is the top-level `global:` block.
+openbao:
+  global:
+    enabled: true
+    # `tlsDisable` and `openshift` are NOT restated here — they are set once as
+    # top-level globals and Helm copies them into this block.
+
+  # Enable deliberately. Resources are set regardless, so turning one on in a
+  # quota'd namespace does not fail admission.
+  injector:
+    enabled: false
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 250m
+        memory: 128Mi
+  csi:
+    enabled: false
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 250m
+        memory: 128Mi
+    agent:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
+
+  ui:
+    enabled: true
+    # Exposed through the frontend listener and the Ingress/Route, not a
+    # LoadBalancer of its own.
+    serviceType: ClusterIP
+
+  server:
+    # UBI on both platforms, so global.openshift is the only platform switch.
+    # Swap the repository for `openbao/openbao` to mirror the smaller image.
+    image:
+      registry: quay.io
+      repository: openbao/openbao-ubi
+      tag: ""                 # defaults to the chart's appVersion
+
+    # The http form returns 204 while the cluster is uninitialised, so the pod
+    # does not flap between install and bootstrap. Clear `path` to fall back to
+    # the subchart's `bao status` exec probe.
+    readinessProbe:
+      enabled: true
+      path: /v1/sys/health?standbyok=true&uninitcode=204
+
+    logLevel: info
+    logFormat: json
+
+    # Go ADDS every certificate in these directories to the system roots rather
+    # than replacing them, so the backend CA becomes trusted for outbound TLS
+    # while public CAs keep working. This is what lets the http audit device —
+    # which takes no CA option of its own — POST over https to the audit proxy.
+    # KEEP IN SYNC with tls.internal.mountPath.
+    extraEnvironmentVars:
+      SSL_CERT_DIR: /openbao/tls/internal
+
+    # OnDelete: a config change marks pods as needing deletion instead of
+    # rolling a quorum automatically. configAnnotation is what makes the change
+    # visible on the pod.
+    updateStrategyType: OnDelete
+    configAnnotation: true
+
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: "2"
+        memory: 1Gi
+
+    # Keep both off: the subchart's Ingress/Route hardcode port 8200, the
+    # backend listener. Use the top-level `ingress`/`route` instead.
+    ingress:
+      enabled: false
+    route:
+      enabled: false
+
+    # The TokenReview binding for the Kubernetes auth method, which this chart
+    # does not use.
+    authDelegator:
+      enabled: false
+
+    dataStorage:
+      enabled: true
+      size: 10Gi
+      storageClass: null
+    # Required by the file audit device. Disabling it fails `operator init`.
+    auditStorage:
+      enabled: true
+      size: 5Gi
+      storageClass: null
+
+    # Leave `pod` EMPTY: the subchart's default already keys off
+    # global.openshift, and anything set here replaces both branches at once.
+    # The render fails if it is set while global.openshift is true.
+    # `container` is set because the subchart's default omits capabilities.drop,
+    # which Pod Security `restricted` rejects.
+    statefulSet:
+      securityContext:
+        pod: {}
+        container:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+    service:
+      enabled: true
+      port: 8200
+      targetPort: 8200
+      # Leave empty. External traffic uses the <fullname>-frontend Service this
+      # chart creates, which carries the Traefik annotations and, in HA, selects
+      # only the active node.
+      extraPorts: []
+
+    # An entry named `https-frontend` is what makes the raft config emit the
+    # frontend listener. KEEP IN SYNC with tls.server.enabled and
+    # tls.server.port; the render fails if they disagree.
+    extraPorts: []
+    #  - containerPort: 8210
+    #    name: https-frontend
+    #    protocol: TCP
+
+    # -------------------------------------------------------------------------
+    # Auto-unseal (seal stanza + plugin registration)
+    # -------------------------------------------------------------------------
+    # Read by the raft HCL below, not by the subchart. Worked examples in
+    # examples/values-azure.yaml and values-transit.yaml; docs/SEAL.md covers
+    # the v2.7.0 plugin migration.
+    seal:
+      # "" | azurekeyvault | transit
+      # Anything but "" requires bootstrap.init.autoUnseal=true; the render
+      # fails otherwise.
+      type: ""
+
+      # Plugin directory. Must be a real readable directory, not a symlink, or
+      # the server fails to start.
+      directory: /openbao/plugins
+      # fail | continue — on a failed OCI plugin download.
+      downloadBehavior: fail
+
+      plugin:
+        # Register an external plugin. Required for azurekeyvault from v2.7.0,
+        # where the built-in cloud seals are removed. A plugin shadows a
+        # built-in of the same name, so registering early makes the upgrade a
+        # no-op.
+        enabled: false
+        # For seals this is always "kms".
+        type: kms
+        # MUST equal seal.type to shadow the built-in.
+        name: azurekeyvault
+
+        #   oci        OpenBao pulls the image and extracts the binary,
+        #              verifying sha256sum. Point `image` at your own registry
+        #              for an airgap.
+        #   preloaded  The binary is already in `directory`, put there by an
+        #              initContainer or baked into a derived image.
+        source: oci
+
+        # source: oci — a multi-arch index; OpenBao selects the right platform.
+        image: ""              # e.g. artifactory.example.com/openbao/openbao-plugin-kms-azure:v0.1.0
+
+        # The same binary is packaged under two different names: this one in
+        # the OCI image, `archiveBinary` in the release tarball. Using the wrong
+        # one fails as "plugin not found" or a checksum mismatch.
+        #
+        # What OpenBao looks for inside the OCI image, and the name it is
+        # installed under in `directory`.
+        binaryName: openbao-plugin-kms-azure
+
+        # Name inside the release tarball, and the name the published checksum
+        # line refers to. Used only by a preloaded-source fetch step.
+        # Per-architecture.
+        archiveBinary: openbao-plugin-kms-azure_linux_amd64_v1
+
+        # source: preloaded — name of the binary inside `directory`.
+        # Defaults to binaryName.
+        command: ""
+
+        # REQUIRED. OpenBao verifies the binary against it. Published in
+        # checksums-kms-<provider>.txt, per-architecture — an arm64 node needs
+        # the arm64 line.
+        sha256sum: ""
+
+        args: []
+        env: []
+
+      azurekeyvault:
+        vaultName: ""
+        keyName: ""
+        # Leave EMPTY for workload identity: these would override what the
+        # azure-workload-identity webhook injects.
+        tenantId: ""
+        clientId: ""
+        # default | environment | managed_identity | client_secret |
+        # certificate | workload_identity
+        # workload_identity is federated OIDC with no client secret in the
+        # cluster. `default` finds it too, but tries a chain first and fails
+        # less clearly.
+        authMethod: workload_identity
+        environment: ""        # default AZUREPUBLICCLOUD
+        resource: ""           # default vault.azure.net
+
+      transit:
+        # Address of the OTHER OpenBao that holds the unseal key.
+        address: ""
+        keyName: autounseal
+        mountPath: transit/
+        namespace: ""
+        # Mounted CA for the remote cluster — its own trust domain, not the
+        # backend CA of this one.
+        tlsCaCert: ""
+        tlsServerName: ""
+        tlsSkipVerify: false
+
+    # -------------------------------------------------------------------------
+    # Audit devices (declarative)
+    # -------------------------------------------------------------------------
+    # Read by the raft HCL below, not by the subchart. Devices live in the
+    # config file, so they are applied at startup and on SIGHUP, cannot be
+    # changed through the API, and deleting a stanza deletes the device. Order
+    # is significant and `file` is first.
+    #
+    # !! The http device makes startup depend on the audit proxy being
+    # !! reachable. Read docs/AUDIT.md before enabling it in production.
+    auditDevices:
+      file:
+        enabled: true
+        path: file
+        # Requires server.auditStorage.enabled, which mounts the PVC here.
+        filePath: /openbao/audit/audit.log
+        # List responses can name thousands of secrets; eliding them cuts
+        # volume and an information-leak surface.
+        elideListResponses: true
+
+      http:
+        # Turn on together with the top-level auditProxy.enabled; the render
+        # fails if only one of the two is set.
+        enabled: false
+        path: http
+        # https when true. The device has no CA option, so trust comes from
+        # SSL_CERT_DIR in extraEnvironmentVars above.
+        # KEEP IN SYNC with auditProxy.tls.enabled.
+        tls: true
+        # Empty -> <fullname>-audit-proxy.<namespace>.svc
+        host: ""
+        port: 9880
+        # Becomes the collector's URL path.
+        uriPath: openbao.audit
+        elideListResponses: true
+
+        # REQUIRED. The device REPLACES the request headers with these rather
+        # than adding to them, so empty means no Content-Type at all, and
+        # the receiver answers 400. The value must be exactly `application/json`
+        # — `application/json; charset=utf-8` is also a 400.
+        #
+        # A 400 here fails `operator init` AFTER the barrier is created, which
+        # leaves an initialised cluster whose unseal keys nobody ever received.
+        # Do not remove this.
+        headers:
+          Content-Type: ["application/json"]
+
+    # Certificates and, optionally, the init keys, mounted into the server pods.
+    # KEEP IN SYNC with tls.*.secretName / tls.*.mountPath and
+    # bootstrap.keyOutput.*; the render fails on a mismatch.
+    volumes:
+      - name: tls-internal
+        secret:
+          secretName: openbao-tls-internal
+          defaultMode: 0400
+      - name: tls-server
+        secret:
+          secretName: openbao-tls-server
+          defaultMode: 0400
+          # optional: with tls.server.enabled=false this Secret is never
+          # issued, and a required mount would hang the pod in
+          # ContainerCreating.
+          optional: true
+      # Required by bootstrap.keyOutput.mountIntoServer:
+      # - name: init-keys
+      #   secret:
+      #     secretName: openbao-init-keys
+      #     defaultMode: 0400
+      #     # optional: the Secret does not exist until the Job has run, and
+      #     # deleting it to destroy the keys must not stop pods starting.
+      #     optional: true
+    volumeMounts:
+      - name: tls-internal
+        mountPath: /openbao/tls/internal
+        readOnly: true
+      - name: tls-server
+        mountPath: /openbao/tls/server
+        readOnly: true
+      # - name: init-keys
+      #   mountPath: /openbao/init-keys
+      #   readOnly: true
+
+    # -------------------------------------------------------------------------
+    # TLS certificate reload
+    # -------------------------------------------------------------------------
+    # OpenBao keeps serving the certificate it loaded at startup, so a
+    # cert-manager renewal is invisible to it until something reloads. Both
+    # methods here reload in place, leaving seal state untouched — a
+    # restart-based reloader would seal every node under Shamir.
+    #
+    #   sighup  A sidecar polls the cert files and SIGHUPs bao. Works on every
+    #           version. Requires shareProcessNamespace and the cert-reloader
+    #           entry in extraContainers below.
+    #   auto    Sets tls_auto_reload on the listener; no sidecar, and
+    #           extraContainers must then be emptied.
+    #
+    #           !! NOT IN 2.6.2 — the binary only WARNS about the unknown
+    #           !! field, so the option looks set, silently is not, and the
+    #           !! certificate goes stale. Use it only after confirming that
+    #           !! warning is absent from the server log.
+    tlsReload:
+      method: sighup
+      interval: 30s
+
+    # -------------------------------------------------------------------------
+    # Break-glass root generation
+    # -------------------------------------------------------------------------
+    # Serves /sys/generate-root/*, which since v2.5.3 is disabled on a listener
+    # by default. Turning `backend` off while bootstrap.revokeRootToken is on
+    # would leave nobody able to administer the cluster, so the render fails on
+    # that pair. Backend only: break-glass stays in-cluster and is never exposed
+    # through the Ingress/Route. Working invocation in docs/RESTORE.md.
+    generateRootEndpoints:
+      backend: true
+      frontend: false
+
+    # Required by tlsReload.method=sighup, so the sidecar can signal bao.
+    shareProcessNamespace: true
+
+    # The cert-reloader for tlsReload.method=sighup. Must be emptied when the
+    # method is `auto`; the render fails on a mismatch. Rendered with tpl in the
+    # subchart's context.
+    extraContainers:
+      - name: cert-reloader
+        # The server image: nothing extra to mirror, and it already has
+        # sha256sum/pidof/kill.
+        image: '{{ .Values.server.image.registry | default "quay.io" }}/{{ .Values.server.image.repository }}:{{ .Values.server.image.tag | default (trimPrefix "v" .Chart.AppVersion) }}'
+        imagePullPolicy: '{{ .Values.server.image.pullPolicy }}'
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+        command: ["/bin/sh", "-ec"]
+        args:
+          - |
+            # Hash every mounted leaf certificate. `find` rather than a fixed
+            # list, so this works whether or not the frontend listener exists.
+            fingerprint() {
+              find /openbao/tls -name 'tls.crt' -type f 2>/dev/null                 | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1
+            }
+            last="$(fingerprint)"
+            echo "[cert-reloader] watching /openbao/tls every {{ (.Values.server.tlsReload | default dict).interval | default "30s" }}"
+            while true; do
+              sleep {{ (.Values.server.tlsReload | default dict).interval | default "30s" | trimSuffix "s" }}
+              cur="$(fingerprint)"
+              [ "$cur" = "$last" ] && continue
+              # Empty means the mount vanished mid-read; do not signal on that.
+              [ -n "$cur" ] || continue
+              pid="$(pidof bao || true)"
+              if [ -n "$pid" ]; then
+                echo "[cert-reloader] certificate changed -- SIGHUP to bao (pid $pid)"
+                kill -SIGHUP $pid && last="$cur"
+              else
+                echo "[cert-reloader] certificate changed but no bao process found; will retry"
+              fi
+            done
+        volumeMounts:
+          - name: tls-internal
+            mountPath: /openbao/tls/internal
+            readOnly: true
+          # Also watched. When the frontend listener is disabled the volume is
+          # optional and mounts empty, so `find` simply matches nothing.
+          - name: tls-server
+            mountPath: /openbao/tls/server
+            readOnly: true
+
+    ha:
+      enabled: true
+      replicas: 3
+
+      # Set rather than left null: the subchart's default api_addr uses the pod
+      # IP, and a standby redirects clients to the leader's api_addr — no
+      # certificate can carry a pod IP SAN, so every redirect would fail
+      # hostname verification once TLS is on. $(VAR) is expanded by the kubelet.
+      apiAddr: https://$(BAO_K8S_POD_NAME).openbao-internal.$(BAO_K8S_NAMESPACE).svc:8200
+      # null -> https://$(HOSTNAME).<fullname>-internal:8201, which is correct.
+      clusterAddr: null
+
+      disruptionBudget:
+        enabled: true
+
+      raft:
+        enabled: true
+        setNodeId: true
+
+        # ---------------------------------------------------------------------
+        # Server configuration (HCL)
+        # ---------------------------------------------------------------------
+        # Rendered with `tpl` in the SUBCHART's context, so `.Values` here is
+        # this `openbao:` block, not the top of this file — which is why the
+        # paths and ports are literals. The frontend listener is emitted only
+        # when server.extraPorts has an `https-frontend` entry.
+        config: |
+          ui = true
+
+          # -- BACKEND listener -------------------------------------------
+          # raft join, request forwarding, service registration, probes,
+          # snapshot agent, injector, CSI. Trust anchor: the backend CA.
+          listener "tcp" {
+            address         = "[::]:8200"
+            cluster_address = "[::]:8201"
+            tls_cert_file   = "/openbao/tls/internal/tls.crt"
+            tls_key_file    = "/openbao/tls/internal/tls.key"
+            tls_min_version = "tls12"
+          {{- if eq ((.Values.server.tlsReload | default dict).method | default "sighup") "auto" }}
+            # Requires a build that has tls_auto_reload; 2.6.2 only warns.
+            tls_auto_reload          = true
+            tls_auto_reload_interval = "{{ (.Values.server.tlsReload).interval | default "30s" }}"
+          {{- end }}
+          {{- if (.Values.server.generateRootEndpoints | default dict).backend }}
+            # Break-glass root generation. Defaults to disabled since v2.5.3, so
+            # this opt-in is what makes `generate-root` possible at all after
+            # the initial root token is revoked. In-cluster only.
+            disable_unauthed_generate_root_endpoints = false
+          {{- end }}
+
+            # Prometheus/VictoriaMetrics scrape without a token. Reachable only
+            # from inside the cluster, and gated by NetworkPolicy.
+            telemetry {
+              unauthenticated_metrics_access = true
+            }
+          }
+          {{- $frontendPort := 0 }}
+          {{- range .Values.server.extraPorts }}
+          {{- if eq (.name | default "") "https-frontend" }}
+          {{- $frontendPort = .containerPort }}
+          {{- end }}
+          {{- end }}
+          {{- if $frontendPort }}
+
+          # -- FRONTEND listener ------------------------------------------
+          # Ingress/Route traffic only. Trust anchor: a DIFFERENT CA. It has no
+          # cluster_address, so no raft peer will ever be validated against it.
+          listener "tcp" {
+            address         = "[::]:{{ $frontendPort }}"
+            tls_cert_file   = "/openbao/tls/server/tls.crt"
+            tls_key_file    = "/openbao/tls/server/tls.key"
+            tls_min_version = "tls12"
+          {{- if eq ((.Values.server.tlsReload | default dict).method | default "sighup") "auto" }}
+            tls_auto_reload          = true
+            tls_auto_reload_interval = "{{ (.Values.server.tlsReload).interval | default "30s" }}"
+          {{- end }}
+            # Left at the secure default on the public-facing listener: an
+            # unauthenticated caller can cancel an in-flight root generation.
+            disable_unauthed_generate_root_endpoints = {{ not ((.Values.server.generateRootEndpoints | default dict).frontend) }}
+          }
+          {{- end }}
+
+          storage "raft" {
+            path = "/openbao/data"
+          {{- $fullname := include "openbao.fullname" . }}
+          {{- $ns := include "openbao.namespace" . }}
+          {{- range $i := until (int .Values.server.ha.replicas) }}
+
+            # A node listing itself here is expected and harmless.
+            retry_join {
+              leader_api_addr     = "https://{{ $fullname }}-{{ $i }}.{{ $fullname }}-internal.{{ $ns }}.svc:8200"
+              # The ONLY CA a join is validated against. A certificate from the
+              # frontend issuer cannot impersonate a peer.
+              leader_ca_cert_file = "/openbao/tls/internal/ca.crt"
+            }
+          {{- end }}
+          }
+
+          # Autopilot is deliberately NOT configured here. cleanup_dead_servers
+          # and friends are not documented parameters of the raft stanza — they
+          # are set through sys/storage/raft/autopilot/configuration, which the
+          # bootstrap Job does. Shipping them here would either be rejected at
+          # parse time or silently ignored.
+
+          service_registration "kubernetes" {}
+          {{- $ad := .Values.server.auditDevices | default dict }}
+          {{- if ($ad.file).enabled }}
+
+          # -- AUDIT devices (declarative) --------------------------------
+          # Order is significant. The file device is the system of record and
+          # is declared first so that it is present before anything that ships
+          # off-box: OpenBao stops serving requests when EVERY enabled device
+          # is failing, so a local device that cannot fail is the safety net.
+          audit "file" "{{ $ad.file.path | default "file" }}" {
+            description = "Durable local audit log. System of record."
+            options {
+              file_path            = "{{ $ad.file.filePath }}"
+              elide_list_responses = "{{ $ad.file.elideListResponses }}"
+            }
+          }
+          {{- end }}
+          {{- if ($ad.http).enabled }}
+          {{- $proxy := $ad.http.host | default (printf "%s-audit-proxy.%s.svc" (include "openbao.fullname" .) (include "openbao.namespace" .)) }}
+
+          # Ships to the forward proxy, which buffers and retries. The device
+          # itself is synchronous and does NOT retry, which is exactly why the
+          # proxy exists and why the file device above is not optional.
+          audit "http" "{{ $ad.http.path | default "http" }}" {
+            description = "Forward audit records to the audit proxy."
+            options {
+              uri                  = "{{ if $ad.http.tls }}https{{ else }}http{{ end }}://{{ $proxy }}:{{ $ad.http.port }}/{{ $ad.http.uriPath }}"
+              elide_list_responses = "{{ $ad.http.elideListResponses }}"
+              {{- with $ad.http.headers }}
+              # Replaces the request headers wholesale, so Content-Type must be
+              # in here or the POST is sent without one.
+              headers              = {{ toJson . | quote }}
+              {{- end }}
+            }
+          }
+          {{- end }}
+
+          telemetry {
+            prometheus_retention_time = "30s"
+            disable_hostname          = true
+          }
+
+          {{- $seal := .Values.server.seal | default dict }}
+          {{- if $seal.type }}
+
+          # -- AUTO-UNSEAL -------------------------------------------------
+          {{- if ($seal.plugin).enabled }}
+          # Only emitted when a plugin is actually registered: OpenBao requires
+          # plugin_directory to be a real, readable, non-symlink directory, so
+          # naming one that is not mounted fails startup for no reason.
+          plugin_directory         = "{{ $seal.directory }}"
+          plugin_download_behavior = "{{ $seal.downloadBehavior }}"
+
+          # External seal plugin. The built-in cloud seals are removed in
+          # v2.7.0; a plugin of the SAME NAME shadows the built-in and takes
+          # priority, so this can be registered before upgrading.
+          #
+          # sha256sum is not optional: it is what makes pulling the binary from
+          # a mirror or Artifactory safe.
+          plugin "{{ $seal.plugin.type | default "kms" }}" "{{ $seal.plugin.name }}" {
+            {{- if eq ($seal.plugin.source | default "preloaded") "oci" }}
+            image       = "{{ $seal.plugin.image }}"
+            binary_name = "{{ $seal.plugin.binaryName }}"
+            {{- else }}
+            command     = "{{ $seal.plugin.command | default $seal.plugin.binaryName }}"
+            {{- end }}
+            sha256sum   = "{{ $seal.plugin.sha256sum }}"
+            {{- with $seal.plugin.args }}
+            args        = {{ toJson . }}
+            {{- end }}
+            {{- with $seal.plugin.env }}
+            env         = {{ toJson . }}
+            {{- end }}
+          }
+          {{- end }}
+          {{- if eq $seal.type "azurekeyvault" }}
+          {{- $akv := $seal.azurekeyvault }}
+
+          seal "azurekeyvault" {
+            vault_name  = "{{ $akv.vaultName }}"
+            key_name    = "{{ $akv.keyName }}"
+            {{- with $akv.authMethod }}
+            # workload_identity reads AZURE_CLIENT_ID, AZURE_TENANT_ID,
+            # AZURE_FEDERATED_TOKEN_FILE and AZURE_AUTHORITY_HOST, all injected
+            # by the azure-workload-identity webhook. No secret in the cluster.
+            auth_method = "{{ . }}"
+            {{- end }}
+            {{- with $akv.tenantId }}
+            tenant_id   = "{{ . }}"
+            {{- end }}
+            {{- with $akv.clientId }}
+            client_id   = "{{ . }}"
+            {{- end }}
+            {{- with $akv.environment }}
+            environment = "{{ . }}"
+            {{- end }}
+            {{- with $akv.resource }}
+            resource    = "{{ . }}"
+            {{- end }}
+          }
+          {{- else if eq $seal.type "transit" }}
+          {{- $tr := $seal.transit }}
+
+          # The token comes from BAO_TOKEN / seal env vars, never from here —
+          # this file is a ConfigMap.
+          seal "transit" {
+            address         = "{{ $tr.address }}"
+            key_name        = "{{ $tr.keyName }}"
+            mount_path      = "{{ $tr.mountPath }}"
+            {{- with $tr.namespace }}
+            namespace       = "{{ . }}"
+            {{- end }}
+            {{- with $tr.tlsCaCert }}
+            tls_ca_cert     = "{{ . }}"
+            {{- end }}
+            {{- with $tr.tlsServerName }}
+            tls_server_name = "{{ . }}"
+            {{- end }}
+            {{- if $tr.tlsSkipVerify }}
+            tls_skip_verify = true
+            {{- end }}
+          }
+          {{- end }}
+          {{- end }}
+
+  # Must stay false: this chart ships its own CronJob, under the top-level
+  # `snapshotAgent`. The render fails if this is enabled.
+  snapshotAgent:
+    enabled: false
+
+# =============================================================================
+# Restore
+# =============================================================================
+# A snapshot holds the ENCRYPTED store, not the unseal keys. Restoring into a
+# cluster with a different master key produces data nobody can decrypt unless
+# you still hold the ORIGINAL unseal keys. Read docs/RESTORE.md first.
+restore:
+  enabled: false
+
+  # Safety interlock: the Job renders only when this exactly equals `snapshot`.
+  # Stops a stale `restore.enabled=true`, or a GitOps replay, from overwriting a
+  # live cluster's storage on its own.
+  confirm: ""
+
+  # Object to restore, relative to source.s3.uri. "latest" resolves to the most
+  # recently modified object at that prefix.
+  snapshot: ""
+
+  # same-cluster  roll this cluster back; seal config unchanged, stays unsealed.
+  # new-cluster   rebuild after total loss; adds -force, and afterwards the
+  #               cluster needs the ORIGINAL unseal keys and root token.
+  mode: same-cluster
+
+  source:
+    # s3 | pvc | url
+    type: s3
+    s3:
+      uri: ""                   # defaults to the snapshot agent's s3Uri
+      host: ""
+      bucket: ""
+      credentialsSecret: ""     # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+      extraFlags: ""
+    pvc:
+      claimName: ""
+      path: ""
+    url: ""
+
+  # Token for the restore call. Defaults to the root token in the init Secret;
+  # set this once that Secret has been destroyed.
+  tokenSecret:
+    name: ""
+    key: token
+
+  # Fetch and inspect the snapshot, then stop without writing. Proves the object
+  # exists, is readable and is a valid snapshot. Do this first.
+  dryRun: false
+
+  # The snapshot agent image; it carries both `bao` and `s3cmd`.
+  image:
+    registry: ghcr.io
+    repository: openbao/openbao-snapshot-agent
+    tag: "0.4.1"
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+  backoffLimit: 0               # never silently retry a destructive operation
+  activeDeadlineSeconds: 1800
+  annotations: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  priorityClassName: ""

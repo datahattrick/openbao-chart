@@ -1,0 +1,35 @@
+# OpenShift overlay. Layer LAST — it turns the Ingress off and the Route on:
+#   helm upgrade --install openbao openbao/ -n openbao \
+#     -f openbao/examples/values-prod.yaml \
+#     -f openbao/examples/values-openshift.yaml
+#
+# What differs on OpenShift:
+#   - The SCC assigns uid/gid/fsGroup, so no pod may pin them. That is the one
+#     line below; it is a Helm global, so it reaches this chart's own workloads
+#     AND the subchart, however deeply either is nested. Do NOT try to clear the
+#     ids with `securityContext: {pod: {}, container: {}}` instead — Helm
+#     coalesces maps key by key, so an empty map clears nothing.
+#   - Routes, not Ingress.
+#
+# The UBI image and the HTTP readiness probe are NOT here: they are the chart
+# default on both platforms, so `global.openshift` is the only thing that has
+# to change to move between them.
+
+# Top level, not under `openbao:` — that is the spelling Helm propagates.
+global:
+  openshift: true
+
+# The OpenShift router terminates instead of an Ingress controller.
+ingress:
+  enabled: false
+route:
+  enabled: true
+  # passthrough is the chart default: OpenBao terminates, so the router needs
+  # neither a certificate nor destinationCACertificate. Switch to reencrypt if
+  # the router has to see the traffic, and paste the frontend CA there.
+  termination: passthrough
+  insecureEdgeTerminationPolicy: Redirect
+
+# Pod Security labels are ignored here; SCCs do the work.
+namespace:
+  create: false

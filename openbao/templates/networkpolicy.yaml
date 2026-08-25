@@ -82,32 +82,6 @@ spec:
           protocol: TCP
       {{- end }}
 {{- end }}
-{{- if $np.monitoring.enabled }}
----
-# Scraping is silently dropped by default-deny, and the metrics simply never
-# appear — with no error anywhere. This is the fix.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: {{ $fullname }}-allow-monitoring-scrape
-  namespace: {{ $ns }}
-  labels:
-    {{- include "obp.labels" . | nindent 4 }}
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: openbao
-  policyTypes:
-    - Ingress
-  ingress:
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $np.monitoring.namespace }}
-      ports:
-        - port: {{ .Values.tls.internal.port }}
-          protocol: TCP
-{{- end }}
 {{- if $ap.enabled }}
 ---
 # The audit proxy accepts records from the OpenBao server pods and NOTHING

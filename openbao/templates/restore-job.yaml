@@ -33,6 +33,7 @@ data:
     #!/bin/sh
     set -eu
     log() { echo "[restore] $*"; }
+    warn() { echo "[restore] WARNING: $*" >&2; }
     die() { echo "[restore] ERROR: $*" >&2; exit 1; }
 
     WORK="$(mktemp -d)"
@@ -91,7 +92,19 @@ data:
 
     # -- 2. restore -------------------------------------------------------
     log "target: ${BAO_ADDR}"
-    bao status >/dev/null 2>&1 || [ $? -eq 2 ] || die "target is not answering"
+
+    # An init Secret written before the trailing-newline fix stores the root
+    # token with a \n, and secretKeyRef injects it verbatim. The CLI then
+    # refuses every command with "configured Vault token contains non-printable
+    # characters and cannot be used".
+    BAO_TOKEN="$(printf '%s' "${BAO_TOKEN:-}" | tr -d '\r\n')"; export BAO_TOKEN
+
+    # Exit 2 is "sealed", which is a fine state to restore into.
+    if ! bao status >/dev/null 2>&1 && [ $? -ne 2 ]; then
+      warn "the target did not answer; bao says:"
+      bao status 2>&1 | sed 's/^/[restore]   /' || true
+      die "target ${BAO_ADDR} is not answering"
+    fi
     [ "$(bao status 2>/dev/null | awk '/^Sealed/ {print $NF}')" = "false" ] \
       || die "target is sealed. A restore is an authenticated API call, so the cluster must be initialised and unsealed FIRST -- even when the point is to replace its contents."
 
@@ -164,13 +177,7 @@ spec:
     spec:
       restartPolicy: Never
       {{- include "obp.priorityClassName" (dict "root" $ "component" $r) | nindent 6 }}
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 100
-        runAsGroup: 1000
-        fsGroup: 1000
-        seccompProfile:
-          type: RuntimeDefault
+      {{- include "obp.podSecurityContext" (dict "root" $ "uid" 100 "gid" 1000) | nindent 6 }}
       {{- with $r.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -196,7 +203,7 @@ spec:
               value: /tmp
             - name: BAO_ADDR
               value: {{ include "obp.baoInternalAddr" . | quote }}
-            {{- if .Values.tls.enabled }}
+            {{- if include "obp.tlsEnabled" . }}
             - name: BAO_CACERT
               value: {{ include "obp.internalCaPath" . | quote }}
             {{- end }}
@@ -247,7 +254,7 @@ spec:
             - name: restore
               mountPath: /restore
               readOnly: true
-            {{- if .Values.tls.enabled }}
+            {{- if include "obp.tlsEnabled" . }}
             - name: tls-internal
               mountPath: {{ .Values.tls.internal.mountPath }}
               readOnly: true
@@ -264,7 +271,7 @@ spec:
           configMap:
             name: {{ $fullname }}-restore
             defaultMode: 0555
-        {{- if .Values.tls.enabled }}
+        {{- if include "obp.tlsEnabled" . }}
         - name: tls-internal
           secret:
             secretName: {{ include "obp.internalTlsSecret" . }}

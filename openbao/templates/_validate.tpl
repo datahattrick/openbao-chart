@@ -18,11 +18,14 @@ naming the value to fix.
 {{- $fullname := include "obp.baoFullname" . -}}
 
 {{/* --- TLS master switch -------------------------------------------------- */}}
-{{- if and .Values.tls.enabled $global.tlsDisable }}
-{{- fail "openbao-platform: tls.enabled is true but openbao.global.tlsDisable is also true. The listeners in the raft config terminate TLS, so the subchart must be told TLS is on. Set openbao.global.tlsDisable=false." }}
-{{- end }}
-{{- if and (not .Values.tls.enabled) (not $global.tlsDisable) }}
-{{- fail "openbao-platform: tls.enabled is false but openbao.global.tlsDisable is false. Set openbao.global.tlsDisable=true, and replace openbao.server.ha.raft.config with a plaintext listener." }}
+{{/* global.tlsDisable is the only switch and both charts read it, so there is */}}
+{{/* no pair left to cross-check. What still needs catching: turning TLS off   */}}
+{{/* without replacing the raft HCL, whose listeners name certificate files    */}}
+{{/* that pki.yaml then never issues.                                          */}}
+{{- if not (include "obp.tlsEnabled" .) }}
+  {{- if contains "tls_cert_file" ((($server.ha).raft).config | default "") }}
+{{- fail "openbao-platform: global.tlsDisable is true, but openbao.server.ha.raft.config still declares tls_cert_file. No certificate is issued when TLS is off, so the server would fail to start. Replace the raft config with plaintext listeners, or set global.tlsDisable=false." }}
+  {{- end }}
 {{- end }}
 
 {{/* --- frontend listener <-> extraPorts ----------------------------------- */}}
@@ -49,7 +52,7 @@ naming the value to fix.
 {{- end }}
 
 {{/* --- server volumes actually mount the certs we issue -------------------- */}}
-{{- if .Values.tls.enabled }}
+{{- if include "obp.tlsEnabled" . }}
   {{- $vols := $server.volumes | default list -}}
   {{- $want := include "obp.internalTlsSecret" . -}}
   {{- $found := false -}}
@@ -100,6 +103,16 @@ naming the value to fix.
 {{- fail (printf "openbao-platform: priorityClassName is set to %q for this chart's workloads, but openbao.server.priorityClassName is empty — so the OpenBao StatefulSet, the one workload whose eviction matters most, would be left unprioritised. Helm cannot template subchart values, so set openbao.server.priorityClassName too (or clear the top-level value)." .Values.priorityClassName) }}
 {{- end }}
 
+{{/* --- OpenShift <-> pinned uids ------------------------------------------- */}}
+{{- if (.Values.global).openshift }}
+  {{- $sc := (($server.statefulSet).securityContext).pod }}
+  {{- if $sc }}
+    {{- if or (kindIs "string" $sc) (or $sc.runAsUser $sc.runAsGroup $sc.fsGroup) }}
+{{- fail "openbao-platform: global.openshift is true but openbao.server.statefulSet.securityContext.pod is set. The SCC assigns uid/gid/fsGroup from the namespace's range and REJECTS a pod that pins them, and anything set here replaces the subchart's platform-aware default wholesale. Leave it empty ({}) and let global.openshift decide, or set global.openshift=false if this is not OpenShift. NOTE: clearing it from an overlay does not work — Helm coalesces maps key by key, so `pod: {}` in a second values file overrides nothing." }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+
 {{/* --- snapshot agent wiring ---------------------------------------------- */}}
 {{- if ($bao.snapshotAgent).enabled }}
 {{- fail "openbao-platform: openbao.snapshotAgent.enabled must stay false — this chart ships its own CronJob so that concurrencyPolicy can be set (the subchart's template does not expose it). Use the top-level `snapshotAgent` section instead." }}
@@ -144,20 +157,29 @@ naming the value to fix.
 {{- fail "openbao-platform: openbao.server.auditDevices.http is enabled but auditProxy.enabled is false. The device is declared in the config file, so OpenBao creates it at startup and will not start if the endpoint does not exist. Enable the proxy, or disable the device." }}
 {{- end }}
 {{- if and .Values.auditProxy.enabled (($ad.http).enabled) }}
+  {{- if ne ((($ad.http).tls | default false) | toString) ((.Values.auditProxy.tls.enabled | default false) | toString) }}
+{{- fail (printf "openbao-platform: openbao.server.auditDevices.http.tls is %v but auditProxy.tls.enabled is %v. One side would speak plaintext to a TLS listener, the audit device would fail, and the bootstrap would refuse to initialise. Set both the same." (($ad.http).tls | default false) (.Values.auditProxy.tls.enabled | default false)) }}
+  {{- end }}
+  {{- if and (($ad.http).tls) (not (include "obp.tlsEnabled" .)) }}
+{{- fail "openbao-platform: openbao.server.auditDevices.http.tls is true but global.tlsDisable is set, so there is no backend CA to issue the proxy a certificate or for OpenBao to verify it against. Turn the hop's TLS off too, or leave global.tlsDisable=false." }}
+  {{- end }}
   {{- if ne (int ($ad.http).port) (int .Values.auditProxy.listen.port) }}
 {{- fail (printf "openbao-platform: openbao.server.auditDevices.http.port is %v but auditProxy.listen.port is %v. Audit records would be posted to a closed port and OpenBao would fail to start." ($ad.http).port .Values.auditProxy.listen.port) }}
   {{- end }}
-  {{- if ne (($ad.http).uriPath | toString) (.Values.auditProxy.listen.tag | toString) }}
-{{- fail (printf "openbao-platform: openbao.server.auditDevices.http.uriPath is %q but auditProxy.listen.tag is %q. Fluent Bit derives its tag from the URI path, so a mismatch means records arrive under a tag no OUTPUT matches and are silently dropped." ($ad.http).uriPath .Values.auditProxy.listen.tag) }}
+  {{- if ne (($ad.http).uriPath | toString) (.Values.auditProxy.listen.path | toString) }}
+{{- fail (printf "openbao-platform: openbao.server.auditDevices.http.uriPath is %q but auditProxy.listen.path is %q. The collector serves one URL path, so records would be POSTed to a 404 and the audit device would fail." ($ad.http).uriPath .Values.auditProxy.listen.path) }}
   {{- end }}
 {{- end }}
 {{- if .Values.auditProxy.enabled }}
   {{- $o := .Values.auditProxy.output -}}
-  {{- if and (eq $o.type "forward") (not $o.forward.host) }}
-{{- fail "openbao-platform: auditProxy.output.type is 'forward' but auditProxy.output.forward.host is empty." }}
+  {{- if not (has $o.type (list "otlphttp" "otlp" "none")) }}
+{{- fail (printf "openbao-platform: auditProxy.output.type is %q; it must be \"otlphttp\", \"otlp\" or \"none\"." $o.type) }}
   {{- end }}
-  {{- if and (eq $o.type "http") (not $o.http.host) }}
-{{- fail "openbao-platform: auditProxy.output.type is 'http' but auditProxy.output.http.host is empty." }}
+  {{- if and (eq $o.type "otlphttp") (not $o.otlphttp.endpoint) }}
+{{- fail "openbao-platform: auditProxy.output.type is 'otlphttp' but auditProxy.output.otlphttp.endpoint is empty. It is the FULL logs URL, e.g. http://vlogs.monitoring.svc:9428/insert/opentelemetry/v1/logs." }}
+  {{- end }}
+  {{- if and (eq $o.type "otlp") (not $o.otlp.endpoint) }}
+{{- fail "openbao-platform: auditProxy.output.type is 'otlp' but auditProxy.output.otlp.endpoint is empty. It is a gRPC host:port." }}
   {{- end }}
 {{- end }}
 
@@ -176,7 +198,39 @@ naming the value to fix.
 {{- if and (or .Values.ingress.enabled .Values.route.enabled) (not .Values.tls.server.enabled) }}
 {{- fail "openbao-platform: external access is enabled but tls.server.enabled is false. Ingress and Route both target the frontend listener, which would not exist. Enable the frontend, or expose the backend listener deliberately by editing this check out." }}
 {{- end }}
-{{- if .Values.tls.server.enabled }}
+{{/* --- certificate sources ------------------------------------------------ */}}
+{{- $beSource := .Values.tls.internal.source | default "cert-manager" }}
+{{- if not (has $beSource (list "cert-manager" "secret")) }}
+{{- fail (printf "openbao-platform: tls.internal.source is %q; it must be \"cert-manager\" (this chart issues the backend certificate) or \"secret\" (you supply it)." $beSource) }}
+{{- end }}
+{{- if and (include "obp.tlsEnabled" .) (eq $beSource "secret") }}
+  {{- if not .Values.tls.internal.secretName }}
+{{- fail "openbao-platform: tls.internal.source is \"secret\" but tls.internal.secretName is empty. Name the Secret holding the backend certificate; it must carry ca.crt as well as tls.crt and tls.key, since raft joins validate peers against it." }}
+  {{- end }}
+  {{- if and .Values.auditProxy.enabled .Values.auditProxy.tls.enabled }}
+{{- fail "openbao-platform: auditProxy.tls.enabled needs the backend Issuer to sign the proxy's certificate, and tls.internal.source is \"secret\", so this chart creates no Issuer. Issue that certificate yourself and set tls.internal.source=cert-manager, or turn the proxy's TLS off." }}
+  {{- end }}
+{{- end }}
+
+{{/* --- Route termination ------------------------------------------------- */}}
+{{- if .Values.route.enabled }}
+  {{- if not (has .Values.route.termination (list "passthrough" "reencrypt")) }}
+{{- fail (printf "openbao-platform: route.termination is %q. Only \"passthrough\" (OpenBao terminates) and \"reencrypt\" (the router terminates and opens a second TLS leg) work here — the frontend listener speaks TLS only, so \"edge\" would send it plaintext." .Values.route.termination) }}
+  {{- end }}
+  {{- if and (eq .Values.route.termination "reencrypt") (not .Values.route.destinationCACertificate) }}
+{{- fail "openbao-platform: route.termination is \"reencrypt\" but route.destinationCACertificate is empty, so the router falls back to the service CA and cannot verify the frontend listener. Paste the frontend CA there, or use termination=passthrough and let OpenBao terminate." }}
+  {{- end }}
+{{- end }}
+
+{{- $feSource := .Values.tls.server.source | default "cert-manager" }}
+{{- if not (has $feSource (list "cert-manager" "secret")) }}
+{{- fail (printf "openbao-platform: tls.server.source is %q; it must be \"cert-manager\" (this chart issues the frontend certificate) or \"secret\" (you supply it)." $feSource) }}
+{{- end }}
+
+{{/* The SAN checks below can only be made against a Certificate this chart
+     writes. With source=secret the names live in someone else's Secret, so a
+     wrong hostname surfaces as a client-side verification failure instead. */}}
+{{- if and .Values.tls.server.enabled (eq $feSource "cert-manager") }}
   {{- $names := .Values.tls.server.dnsNames | default list -}}
   {{- if .Values.ingress.enabled }}
     {{- if not (has .Values.ingress.host $names) }}
@@ -193,8 +247,12 @@ naming the value to fix.
   {{- end }}
 {{- end }}
 
+{{- if and .Values.tls.server.enabled (eq $feSource "secret") (not .Values.tls.server.secretName) }}
+{{- fail "openbao-platform: tls.server.source is \"secret\" but tls.server.secretName is empty. Name the kubernetes.io/tls Secret holding the frontend certificate; the chart mounts it rather than issuing one." }}
+{{- end }}
+
 {{/* --- issuer separation ----------------------------------------------------- */}}
-{{- if .Values.tls.server.enabled }}
+{{- if and .Values.tls.server.enabled (eq $feSource "cert-manager") }}
   {{/* Resolve what the BACKEND leaf is actually issued by: either an issuer
        the operator nominated, or the CA this chart creates. Both have to be
        compared, or pointing the frontend at the chart-created CA slips through
@@ -205,9 +263,9 @@ naming the value to fix.
   {{- if and (eq $beName .Values.tls.server.issuerRef.name) (eq $beKind .Values.tls.server.issuerRef.kind) }}
 {{- fail (printf "openbao-platform: the frontend certificate is configured to use the SAME issuer as the backend (%s/%s), which defeats the trust separation this chart exists to provide — a certificate from that issuer would be valid for both the ingress and a raft peer. Point tls.server.issuerRef at a different CA, or set tls.server.enabled=false and accept a single trust domain deliberately." $beKind $beName) }}
   {{- end }}
-{{- end }}
-{{- if and .Values.tls.server.enabled (not .Values.tls.server.issuerRef.name) }}
-{{- fail "openbao-platform: tls.server.enabled is true but tls.server.issuerRef.name is empty. The frontend must be issued by an issuer you nominate — it deliberately does not fall back to the backend CA." }}
+  {{- if not .Values.tls.server.issuerRef.name }}
+{{- fail "openbao-platform: tls.server.enabled is true but tls.server.issuerRef.name is empty. The frontend must be issued by an issuer you nominate — it deliberately does not fall back to the backend CA. Set tls.server.source=secret to supply the certificate yourself instead." }}
+  {{- end }}
 {{- end }}
 
 {{/* --- TLS reload -------------------------------------------------------------- */}}
@@ -222,7 +280,7 @@ naming the value to fix.
 {{- fail (printf "openbao-platform: tlsReload.method is \"auto\" but the server image tag is %q. tls_auto_reload does not exist in that release (PR #3530 landed on main after v2.6.2). OpenBao would only log `unknown or unsupported field tls_auto_reload` and carry on serving the stale certificate — the option looks applied and silently is not. Use method \"sighup\" until you are on a build that has it, and confirm by checking that warning is absent from the server log." $tag) }}
     {{- end }}
 {{- end }}
-{{- if .Values.tls.enabled }}
+{{- if include "obp.tlsEnabled" . }}
   {{- $hasSidecar := false }}
   {{- range ($server.extraContainers) | default list }}
     {{- if eq (.name | default "") "cert-reloader" }}{{ $hasSidecar = true }}{{ end }}

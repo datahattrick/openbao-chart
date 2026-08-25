@@ -1,5 +1,5 @@
 apiVersion: v2
-name: openbao-platform
+name: openbao
 description: >-
   Opinionated umbrella around the official OpenBao chart: cert-manager PKI with
   split frontend/backend trust domains, a one-shot bootstrap Job that initialises

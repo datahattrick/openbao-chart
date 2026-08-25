@@ -45,7 +45,7 @@ data:
   {{- with $s.s3.baoSecretPath }}
   BAO_SECRET_PATH: {{ . | quote }}
   {{- end }}
-  {{- if .Values.tls.enabled }}
+  {{- if include "obp.tlsEnabled" . }}
   BAO_CACERT: {{ include "obp.internalCaPath" . | quote }}
   {{- end }}
   {{- range $k, $v := $s.extraEnv }}
@@ -99,13 +99,7 @@ spec:
           restartPolicy: {{ $s.restartPolicy }}
           serviceAccountName: {{ $sa }}
           {{- include "obp.priorityClassName" (dict "root" $ "component" $s) | nindent 10 }}
-          securityContext:
-            runAsNonRoot: true
-            runAsUser: 100
-            runAsGroup: 1000
-            fsGroup: 1000
-            seccompProfile:
-              type: RuntimeDefault
+          {{- include "obp.podSecurityContext" (dict "root" $ "uid" 100 "gid" 1000) | nindent 10 }}
           {{- with $s.nodeSelector }}
           nodeSelector:
             {{- toYaml . | nindent 12 }}
@@ -147,7 +141,7 @@ spec:
                   mountPath: /bao-snapshots
                 - name: tmp
                   mountPath: /tmp
-                {{- if .Values.tls.enabled }}
+                {{- if include "obp.tlsEnabled" . }}
                 - name: tls-internal
                   mountPath: {{ .Values.tls.internal.mountPath }}
                   readOnly: true
@@ -160,7 +154,7 @@ spec:
               emptyDir: {}
             - name: tmp
               emptyDir: {}
-            {{- if .Values.tls.enabled }}
+            {{- if include "obp.tlsEnabled" . }}
             - name: tls-internal
               secret:
                 secretName: {{ include "obp.internalTlsSecret" . }}

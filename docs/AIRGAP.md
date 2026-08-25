@@ -6,8 +6,8 @@ The subchart is vendored and `Chart.lock` is committed, so rendering never
 contacts a Helm repository:
 
 ```
-charts/openbao-platform/charts/openbao-0.29.2.tgz    48 KB
-charts/openbao-platform/Chart.lock
+openbao/charts/openbao-0.29.2.tgz    48 KB
+openbao/Chart.lock
 ```
 
 To bump it: edit `Chart.yaml`, run `helm dependency update`, commit the new
@@ -19,15 +19,16 @@ Four, all overridable:
 
 | Image | Used by | Values key |
 |---|---|---|
-| `quay.io/openbao/openbao:2.6.2` | server **and** bootstrap Job | `openbao.server.image` |
+| `quay.io/openbao/openbao-ubi:2.6.2` | server **and** bootstrap Job | `openbao.server.image` |
 | `docker.io/alpine/kubectl:1.34.1` | bootstrap init container | `bootstrap.kubectlImage` |
 | `ghcr.io/openbao/openbao-snapshot-agent:0.4.1` | snapshot CronJob **and** restore Job | `openbao.snapshotAgent.image`, `restore.image` |
-| `docker.io/fluent/fluent-bit:4.0.5` | audit proxy | `auditProxy.image` |
+| `docker.io/otel/opentelemetry-collector-contrib:0.159.0` | audit proxy | `auditProxy.image` |
 | `ghcr.io/openbao/openbao-plugin-kms-azure:v0.1.0` | Azure Key Vault seal (only when `seal.plugin.source: oci`) | `openbao.server.seal.plugin.image` |
 | `docker.io/curlimages/curl:8.11.1` | seal plugin fetch initContainer (only when `seal.plugin.source: preloaded`) | in `values-azure.yaml` |
 
-On OpenShift, `values-openshift.yaml` switches the server to
-`quay.io/openbao/openbao-ubi`.
+The UBI image is the default on both platforms. Swap
+`openbao.server.image.repository` for `openbao/openbao` to mirror the smaller
+one instead.
 
 ### Why kubectl is a second image
 
@@ -79,7 +80,7 @@ for img in \
   quay.io/openbao/openbao:2.6.2 \
   docker.io/alpine/kubectl:1.34.1 \
   ghcr.io/openbao/openbao-snapshot-agent:0.4.1 \
-  docker.io/fluent/fluent-bit:4.0.5
+  docker.io/otel/opentelemetry-collector-contrib:0.159.0
 do
   skopeo copy "docker://$img" "docker://$REG/${img#*/}"
 done
@@ -99,7 +100,7 @@ openbao:
 bootstrap:
   kubectlImage: { registry: registry.internal.example.com, repository: alpine/kubectl, tag: "1.34.1" }
 auditProxy:
-  image: { registry: registry.internal.example.com, repository: fluent/fluent-bit, tag: "4.0.5" }
+  image: { registry: registry.internal.example.com, repository: otel/opentelemetry-collector-contrib, tag: "0.159.0" }
 restore:
   image: { registry: registry.internal.example.com, repository: openbao/openbao-snapshot-agent, tag: "0.4.1" }
 ```

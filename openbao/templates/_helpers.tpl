@@ -93,6 +93,20 @@ false
 {{- end -}}
 {{- end -}}
 
+{{/*
+Is TLS on? Single source of truth: the subchart's own `global.tlsDisable`, which
+Helm propagates to every layer, so there is nothing to keep in sync.
+
+Returns "true" or the empty string, so it reads directly as a gate:
+  {{- if include "obp.tlsEnabled" . }}
+*/}}
+{{- define "obp.tlsEnabled" -}}
+{{- if eq ((.Values.global).tlsDisable | toString) "true" -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
 {{/* Secret holding the unseal/recovery keys and the initial root token. */}}
 {{- define "obp.initKeysSecret" -}}
 {{- .Values.bootstrap.keyOutput.secretName | default (printf "%s-init-keys" (include "obp.baoFullname" .)) -}}
@@ -159,4 +173,33 @@ Usage: {{- include "obp.priorityClassName" (dict "root" $ "component" .Values.bo
 {{- if $pc }}
 priorityClassName: {{ $pc }}
 {{- end }}
+{{- end -}}
+
+{{/*
+Pod-level securityContext for every workload this chart owns.
+
+OpenShift hands out the uid, gid and fsGroup from the namespace's SCC range and
+REJECTS a pod that pins them to anything outside it, so the ids are emitted only
+when global.openshift is false. The rest (runAsNonRoot, seccompProfile) is
+accepted by both restricted-v2 and Pod Security `restricted`, so it is always
+emitted and the default renders cleanly on either platform.
+
+Why a global and not a per-component map: `global.openshift` is a scalar, so it
+merges predictably no matter how deeply this chart is nested, and it reaches the
+openbao subchart without being restated. Clearing a MAP from a parent values
+file does not work — Helm coalesces maps key by key, so `securityContext: {}`
+leaves every inherited key in place. That is the bug this replaced.
+
+Usage: {{- include "obp.podSecurityContext" (dict "root" $ "uid" 100 "gid" 1000) | nindent 6 }}
+*/}}
+{{- define "obp.podSecurityContext" -}}
+securityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+  {{- if not (.root.Values.global).openshift }}
+  runAsUser: {{ .uid }}
+  runAsGroup: {{ .gid }}
+  fsGroup: {{ .gid }}
+  {{- end }}
 {{- end -}}
