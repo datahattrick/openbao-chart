@@ -102,8 +102,8 @@ Rolling this cluster back to an earlier point. Seal config is unchanged, so no
 `-force`, and the cluster stays unsealed throughout.
 
 ```sh
-helm upgrade openbao charts/openbao-platform -n openbao \
-  -f charts/openbao-platform/values-heathernetes.yaml \
+helm upgrade openbao openbao/ -n openbao \
+  -f values-heathernetes.yaml \
   --set restore.enabled=true \
   --set restore.snapshot=bao_2026-08-19-2227.snapshot \
   --set restore.confirm=bao_2026-08-19-2227.snapshot \
@@ -130,9 +130,12 @@ OpenBao 2.6.2:
    the Ingress/Route. The render refuses `bootstrap.revokeRootToken` without
    it — otherwise revoking the initial token locks you out permanently.
 
-2. **`bao operator generate-root` does not work.** The CLI calls the legacy
-   `/v1/sys/generate-root-token/attempt` path, which is not the one the server
-   registers, and returns **403 permission denied**. Use the API directly.
+2. **`bao operator generate-root` does not work, in any of its forms.** The CLI
+   calls the legacy `/v1/sys/generate-root-token/attempt` path, which the server
+   does not register, and returns **403 permission denied**. That covers `-init`,
+   `-generate-otp` and `-decode`: even the decode, which is arithmetic on values
+   you already hold, calls the status endpoint first. Use the API, and decode the
+   token yourself.
 
 ```sh
 # From a pod in the namespace, against the BACKEND listener.
@@ -143,17 +146,24 @@ CA=/openbao/tls/internal/ca.crt
 curl -s --cacert $CA "$A/attempt"
 curl -s --cacert $CA -X DELETE "$A/attempt"      # 204
 
-# Start. Returns a nonce and a one-time pad.
-curl -s --cacert $CA -X PUT "$A/attempt"
+# Start. Send an empty body and the server generates the one-time pad for you.
+curl -s --cacert $CA -X PUT -d '{}' "$A/attempt"
 # -> {"nonce":"…","otp":"…","required":3,…}
 
 # Submit `required` unseal keys, once each, with that nonce.
 curl -s --cacert $CA -X PUT "$A/update" \
   --data-raw '{"key":"<unseal-key>","nonce":"<nonce>"}'
 # the last one returns {"complete":true,"encoded_token":"…"}
+```
 
-# Decode locally: the token is encoded_token XOR'd with the OTP.
-bao operator generate-root -decode=<encoded_token> -otp=<otp>
+Decode it yourself: the token is `encoded_token`, base64-decoded, XOR'd byte for
+byte with the OTP.
+
+```sh
+python3 -c 'import base64,sys
+enc,otp=sys.argv[1],sys.argv[2]
+raw=base64.b64decode(enc + "="*((4-len(enc)%4)%4))
+print(bytes(a^b for a,b in zip(raw,otp.encode())).decode())' <encoded_token> <otp>
 ```
 
 Then store it and point the restore at it:

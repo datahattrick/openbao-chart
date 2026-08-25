@@ -1,0 +1,367 @@
+{{- if .Values.auditProxy.enabled }}
+{{- $fullname := include "obp.baoFullname" . }}
+{{- $ns := include "obp.namespace" . }}
+{{- $ap := .Values.auditProxy }}
+{{- $name := printf "%s-audit-proxy" $fullname }}
+{{- $sa := $ap.serviceAccount.name | default $name }}
+{{- $tlsSecret := $ap.tls.secretName | default (printf "%s-tls" $name) }}
+{{- /* stdout export of audit records, for testing the pipeline. Gated on the
+       same development switch as key reveal: everything on stdout is collected
+       off the node into a general-purpose log store. */}}
+{{- $debugExporter := false }}
+{{- if $ap.output.debug }}
+  {{- if ne (.Values.deployment.environment | lower) "development" }}
+{{- fail "openbao-platform: auditProxy.output.debug prints audit records to the container's stdout, which the node log collector ships to a general-purpose log store. It requires deployment.environment=development." }}
+  {{- end }}
+  {{- $debugExporter = true }}
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: audit-proxy
+data:
+  config.yaml: |
+{{- if $ap.configOverride }}
+    {{- tpl $ap.configOverride . | nindent 4 }}
+{{- else }}
+    # =====================================================================
+    # OpenBao audit forward proxy
+    # =====================================================================
+    # Accepts audit records from OpenBao's http audit device and exports them
+    # onward with buffering and retry.
+    #
+    # There is NO debug or file exporter here, and this chart will not render
+    # one. Audit records on a container's stdout are collected off the node
+    # into a general-purpose log store, which is the exposure this proxy
+    # exists to avoid. service.telemetry.logs.level below controls the
+    # collector's own diagnostics, never record payloads.
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:{{ $ap.healthPort }}
+{{- if and $ap.buffer.enabled (ne $ap.output.type "none") }}
+      file_storage/queue:
+        # The emptyDir mount root: file_storage requires the directory to
+        # already exist.
+        directory: /var/lib/otelcol
+        timeout: 10s
+{{- end }}
+
+    receivers:
+      # One JSON object per audited request, POSTed by OpenBao.
+      webhook_event:
+        endpoint: 0.0.0.0:{{ $ap.listen.port }}
+        path: /{{ $ap.listen.path }}
+{{- if $ap.tls.enabled }}
+        tls:
+          cert_file: /etc/otelcol/tls/tls.crt
+          key_file: /etc/otelcol/tls/tls.key
+{{- end }}
+
+    processors:
+      resource:
+        attributes:
+{{- range $k, $v := $ap.resourceAttributes }}
+          - key: {{ $k }}
+            value: {{ $v | quote }}
+            action: upsert
+{{- end }}
+          - key: openbao_cluster
+            value: {{ .Release.Name | quote }}
+            action: upsert
+          - key: openbao_namespace
+            value: {{ $ns | quote }}
+            action: upsert
+      batch:
+        timeout: 5s
+
+    exporters:
+{{- if $debugExporter }}
+      # DEVELOPMENT ONLY. Prints every audit record to this container's stdout,
+      # where the node log collector will pick it up. deployment.environment
+      # must be `development`; the render fails if it is set in production.
+      debug:
+        verbosity: detailed
+{{- end }}
+{{- if eq $ap.output.type "otlphttp" }}
+      otlphttp:
+        logs_endpoint: {{ $ap.output.otlphttp.endpoint | quote }}
+{{- if or $ap.output.otlphttp.headers $ap.output.otlphttp.headerSecret }}
+        headers:
+{{- range $k, $v := $ap.output.otlphttp.headers }}
+          {{ $k }}: {{ $v | quote }}
+{{- end }}
+{{- if $ap.output.otlphttp.headerSecret }}
+          # From the Secret named in output.otlphttp.headerSecret.
+          authorization: ${env:OTEL_AUTHORIZATION}
+{{- end }}
+{{- end }}
+        tls:
+          insecure: {{ $ap.output.otlphttp.tls.insecure }}
+{{- if $ap.output.otlphttp.tls.caSecretName }}
+          ca_file: /etc/otelcol/downstream-ca/ca.crt
+{{- end }}
+        retry_on_failure:
+          enabled: true
+{{- if $ap.buffer.enabled }}
+        sending_queue:
+          enabled: true
+          storage: file_storage/queue
+          queue_size: {{ $ap.buffer.queueSize }}
+{{- end }}
+{{- else if eq $ap.output.type "otlp" }}
+      otlp:
+        endpoint: {{ $ap.output.otlp.endpoint | quote }}
+{{- if or $ap.output.otlp.headers $ap.output.otlp.headerSecret }}
+        headers:
+{{- range $k, $v := $ap.output.otlp.headers }}
+          {{ $k }}: {{ $v | quote }}
+{{- end }}
+{{- if $ap.output.otlp.headerSecret }}
+          authorization: ${env:OTEL_AUTHORIZATION}
+{{- end }}
+{{- end }}
+        tls:
+          insecure: {{ $ap.output.otlp.tls.insecure }}
+{{- if $ap.output.otlp.tls.caSecretName }}
+          ca_file: /etc/otelcol/downstream-ca/ca.crt
+{{- end }}
+        retry_on_failure:
+          enabled: true
+{{- if $ap.buffer.enabled }}
+        sending_queue:
+          enabled: true
+          storage: file_storage/queue
+          queue_size: {{ $ap.buffer.queueSize }}
+{{- end }}
+{{- else }}
+      # output.type is none: records are accepted and dropped. For testing the
+      # OpenBao -> proxy hop on its own.
+      nop: {}
+{{- end }}
+
+    service:
+      extensions:
+        - health_check
+{{- if and $ap.buffer.enabled (ne $ap.output.type "none") }}
+        - file_storage/queue
+{{- end }}
+      telemetry:
+        logs:
+          level: {{ $ap.logLevel }}
+        metrics:
+          level: none
+      pipelines:
+        logs:
+          receivers: [webhook_event]
+          processors: [resource, batch]
+{{- $exporters := list }}
+{{- if eq $ap.output.type "otlphttp" }}{{ $exporters = append $exporters "otlphttp" }}{{ end }}
+{{- if eq $ap.output.type "otlp" }}{{ $exporters = append $exporters "otlp" }}{{ end }}
+{{- if $debugExporter }}{{ $exporters = append $exporters "debug" }}{{ end }}
+{{- if not $exporters }}{{ $exporters = append $exporters "nop" }}{{ end }}
+          exporters: [{{ join ", " $exporters }}]
+{{- end }}
+{{- if $ap.serviceAccount.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: audit-proxy
+# The proxy never calls the API server.
+automountServiceAccountToken: false
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: audit-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: audit-proxy
+  ports:
+    - name: audit
+      port: {{ $ap.listen.port }}
+      targetPort: audit
+      protocol: TCP
+    - name: health
+      port: {{ $ap.healthPort }}
+      targetPort: health
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: audit-proxy
+  {{- with $ap.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ $ap.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: audit-proxy
+  template:
+    metadata:
+      labels:
+        {{- include "obp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: audit-proxy
+      annotations:
+        # Restart on a config change; Deployments do not watch ConfigMaps.
+        # Hashed from the values rather than the rendered file, because the
+        # ConfigMap lives in this same template and including it here would
+        # recurse.
+        checksum/config: {{ toYaml $ap | sha256sum | trunc 32 }}
+        {{- if $ap.excludeFromLogCollection }}
+        # Belt and braces. Audit records are not written to this container's
+        # stdout at all, but if a future config change ever leaked one, these
+        # keep it out of the cluster log store. Keys differ per collector, so
+        # the common ones are all set; add yours via auditProxy.podAnnotations.
+        fluentbit.io/exclude: "true"
+        logging.coreos.com/exclude: "true"
+        vector.dev/exclude: "true"
+        {{- end }}
+        {{- with $ap.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ $sa }}
+      automountServiceAccountToken: false
+      {{- include "obp.priorityClassName" (dict "root" $ "component" $ap) | nindent 6 }}
+      {{- include "obp.podSecurityContext" (dict "root" $ "uid" 1000 "gid" 1000) | nindent 6 }}
+      {{- with $ap.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $ap.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $ap.affinity }}
+      affinity:
+        {{- toYaml $ap.affinity | nindent 8 }}
+      {{- else if gt (int $ap.replicaCount) 1 }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: {{ .Release.Name }}
+                    app.kubernetes.io/component: audit-proxy
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      containers:
+        - name: otel-collector
+          image: "{{ $ap.image.registry }}/{{ $ap.image.repository }}:{{ $ap.image.tag }}"
+          imagePullPolicy: {{ $ap.image.pullPolicy }}
+          args:
+            - --config=/etc/otelcol/config.yaml
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml $ap.resources | nindent 12 }}
+          ports:
+            - name: audit
+              containerPort: {{ $ap.listen.port }}
+              protocol: TCP
+            - name: health
+              containerPort: {{ $ap.healthPort }}
+              protocol: TCP
+          {{- $headerSecret := "" }}
+          {{- if eq $ap.output.type "otlphttp" }}{{ $headerSecret = $ap.output.otlphttp.headerSecret }}{{ end }}
+          {{- if eq $ap.output.type "otlp" }}{{ $headerSecret = $ap.output.otlp.headerSecret }}{{ end }}
+          {{- if $headerSecret }}
+          env:
+            - name: OTEL_AUTHORIZATION
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $headerSecret }}
+                  key: authorization
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            - name: buffer
+              mountPath: /var/lib/otelcol
+            {{- if $ap.tls.enabled }}
+            - name: tls
+              mountPath: /etc/otelcol/tls
+              readOnly: true
+            {{- end }}
+            {{- if or (and (eq $ap.output.type "otlphttp") $ap.output.otlphttp.tls.caSecretName) (and (eq $ap.output.type "otlp") $ap.output.otlp.tls.caSecretName) }}
+            - name: downstream-ca
+              mountPath: /etc/otelcol/downstream-ca
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}
+        - name: buffer
+          # emptyDir, not a PVC: the durable copy of every record is already on
+          # the audit PVC via the file device, so this only has to survive a
+          # downstream blip. It also keeps replicaCount > 1 possible, which a
+          # ReadWriteOnce PVC would not.
+          emptyDir:
+            sizeLimit: {{ $ap.buffer.sizeLimit }}
+        {{- if $ap.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ $tlsSecret }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if and (eq $ap.output.type "otlphttp") $ap.output.otlphttp.tls.caSecretName }}
+        - name: downstream-ca
+          secret:
+            secretName: {{ $ap.output.otlphttp.tls.caSecretName }}
+        {{- else if and (eq $ap.output.type "otlp") $ap.output.otlp.tls.caSecretName }}
+        - name: downstream-ca
+          secret:
+            secretName: {{ $ap.output.otlp.tls.caSecretName }}
+        {{- end }}
+      {{- with ((index .Values "openbao").global).imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

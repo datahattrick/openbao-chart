@@ -18,7 +18,7 @@ flowchart TB
         svcF["Service<br/>openbao-frontend :8210"]
         sts["StatefulSet openbao-N<br/>:8200 backend · :8210 frontend · :8201 cluster"]
         boot["Job openbao-bootstrap<br/><i>completions 1, parallelism 1</i>"]
-        proxy["Deployment openbao-audit-proxy<br/>Fluent Bit :9880"]
+        proxy["Deployment openbao-audit-proxy<br/>OTel Collector :9880"]
         cron["CronJob openbao-snapshot"]
         pki["cert-manager<br/>backend CA (Issuer)"]
         keys[("Secret<br/>openbao-init-keys")]
@@ -28,7 +28,7 @@ flowchart TB
 
     subgraph other["other namespaces"]
         s3[("S3 / Garage")]
-        logs[("Fluent Bit /<br/>VictoriaLogs")]
+        logs[("OTLP receiver<br/>VictoriaLogs, ...")]
     end
 
     client -->|"TLS: frontend CA"| traefik
@@ -107,6 +107,36 @@ handshake is validated against — which is the one that matters.
 ClusterIssuer is referenceable from any namespace, so anyone able to create a
 Certificate anywhere in the cluster could mint something a raft join would trust.
 Namespacing it makes that impossible without RBAC in this namespace.
+
+### Where the frontend certificate comes from
+
+`tls.server.source` selects one of two.
+
+| | `cert-manager` | `secret` |
+|---|:---:|:---:|
+| Chart creates a `Certificate` | ✅ | ❌ |
+| Needs cert-manager | ✅ | ❌ |
+| Needs `tls.server.issuerRef.name` | ✅ | ❌ |
+| Needs `tls.server.dnsNames` | ✅ | ❌ |
+| Renewed automatically | ✅ | ❌ |
+| Hostname checked at render time | ✅ | ❌ |
+
+With `secret`, `tls.server.secretName` names a `kubernetes.io/tls` Secret you
+create in the release namespace, holding `tls.crt` and `tls.key`.
+`openbao.server.volumes` must mount that same name.
+The SANs are not visible to the chart, so a hostname the certificate does not
+cover surfaces as a client-side verification failure at request time.
+
+The backend trust domain always uses cert-manager.
+
+### Route termination
+
+`route.termination` defaults to `passthrough`: the router forwards the TLS
+stream and OpenBao terminates it, so clients see the frontend certificate and
+client-certificate auth survives.
+`reencrypt` has the router terminate and open a second TLS leg to 8210, and
+requires `route.destinationCACertificate` to hold the frontend CA.
+`edge` fails the render, since the frontend listener serves TLS only.
 
 ### Why the ports look backwards
 

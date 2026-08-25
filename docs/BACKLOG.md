@@ -49,7 +49,7 @@ A `VMRule` with five rules is the highest value-per-line work remaining.
 Under Shamir there is no automatic unseal. A node reboot, an eviction or a
 `kubectl delete pod` to pick up config leaves the cluster sealed until someone
 intervenes — the bootstrap Job only runs on `helm upgrade`.
-`scripts/unseal.sh` makes that a one-liner, but it is a mitigation, not a fix.
+Unsealing by hand is a mitigation, not a fix.
 **Auto-unseal is the fix** (`values-azure.yaml` / `values-transit.yaml`).
 Until then, treat any restart of a Shamir cluster as a planned operation.
 
@@ -124,4 +124,4 @@ download time. Make it a value.
 ### 9. `values-transit.yaml` references Secrets nothing creates
 `openbao-transit-unseal` (the token) and `openbao-transit-ca` must exist before
 install, and neither is created nor validated. Either add a pre-flight check or
-document them in `scripts/prepare-namespace.sh`.
+document them alongside the values.

@@ -5,8 +5,8 @@
 # deliberately non-empty so the chart renders, and deliberately obvious so a
 # forgotten one fails at deploy rather than silently doing the wrong thing.
 #
-#   helm upgrade --install openbao charts/openbao-platform -n openbao \
-#     -f charts/openbao-platform/values-prod.yaml
+#   helm upgrade --install openbao openbao/ -n openbao \
+#     -f openbao/examples/values-prod.yaml
 #
 # Layer an auto-unseal overlay on top (strongly recommended — see the note at
 # the bottom), and values-openshift.yaml LAST if you are on OpenShift:
@@ -33,8 +33,6 @@ namespace:
 # TLS — two trust domains
 # -----------------------------------------------------------------------------
 tls:
-  enabled: true
-
   # Namespace-local CA for the BACKEND domain. Deliberately not a ClusterIssuer:
   # one of those can be referenced from any namespace, so anyone able to create
   # a Certificate anywhere could mint something a raft join would trust.
@@ -121,19 +119,12 @@ auditProxy:
   enabled: true
   replicaCount: 2
   output:
-    type: forward
-    forward:
-      host: CHANGEME-fluent-bit.logging.svc.cluster.local
-      port: 24224
+    type: otlphttp
+    otlphttp:
+      # The FULL OTLP logs URL of your log store.
+      endpoint: CHANGEME-http://otel-collector.logging.svc.cluster.local:4318/v1/logs
       tls:
-        enabled: false
-    # The sink's namespace almost certainly has a default-deny ingress policy,
-    # in which case shipping fails silently and records pile up in the buffer.
-    # This opens just the proxy, on just the sink port, in that namespace. Off
-    # by default because writing into someone else's namespace is their call.
-    downstreamNetworkPolicy:
-      enabled: false
-      namespace: CHANGEME-logging
+        insecure: false
 
 # -----------------------------------------------------------------------------
 # Bootstrap

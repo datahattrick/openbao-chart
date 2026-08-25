@@ -74,23 +74,41 @@ data:
     #
     # So the endpoint is proven to work here, with the same method, path and
     # Content-Type OpenBao will use, before init is allowed to run at all.
+    # The two server images ship different HTTP clients -- the Alpine image has
+    # busybox wget and no curl, the UBI image has curl and no wget -- and the
+    # bootstrap runs on whichever one the server uses. Only curl can be pointed
+    # at a CA, so an https pre-flight requires it.
+    audit_post() {
+      if command -v curl >/dev/null 2>&1; then
+        set -- --silent --show-error --fail --output /dev/null \
+               --header 'Content-Type: application/json' \
+               --data '{"type":"bootstrap-preflight"}'
+        [ -n "${AUDIT_CA_CERT:-}" ] && set -- "$@" --cacert "$AUDIT_CA_CERT"
+        curl "$@" "$AUDIT_HTTP_URL"
+      else
+        case "$AUDIT_HTTP_URL" in
+          https://*) die "the audit endpoint is https but this image has no curl,
+    so the pre-flight cannot verify the certificate. Use the UBI server image,
+    or set openbao.server.auditDevices.http.tls=false." ;;
+        esac
+        wget -q -O /dev/null \
+          --header='Content-Type: application/json' \
+          --post-data='{"type":"bootstrap-preflight"}' \
+          "$AUDIT_HTTP_URL"
+      fi
+    }
+
     if [ "$AUDIT_HTTP_ENABLED" = "true" ]; then
       log "pre-flighting the audit endpoint ${AUDIT_HTTP_URL}"
       waited=0
-      until wget -q -O /dev/null \
-              --header='Content-Type: application/json' \
-              --post-data='{"type":"bootstrap-preflight"}' \
-              "$AUDIT_HTTP_URL" 2>/dev/null; do
+      until audit_post 2>/dev/null; do
         # Report the actual error the first time round rather than looping in
         # silence. A hang here is almost always one of: the proxy still
-        # starting, a NetworkPolicy that does not admit this pod, or Fluent Bit
-        # rejecting the Content-Type.
+        # starting, a NetworkPolicy that does not admit this pod, Fluent Bit
+        # rejecting the Content-Type, or a certificate the CA does not cover.
         if [ "$waited" -eq 0 ]; then
-          warn "first attempt failed; wget says:"
-          wget -O /dev/null \
-            --header='Content-Type: application/json' \
-            --post-data='{"type":"bootstrap-preflight"}' \
-            "$AUDIT_HTTP_URL" 2>&1 | sed 's/^/[bootstrap]   /' || true
+          warn "first attempt failed; the client says:"
+          audit_post 2>&1 | sed 's/^/[bootstrap]   /' || true
           warn "retrying every 5s for up to ${AUDIT_WAIT_TIMEOUT}s"
         fi
         waited=$((waited + 5))
@@ -136,7 +154,13 @@ data:
       # fixed column so a label change cannot silently shift the value.
       printf '%s\n' "$INIT_OUT" | awk '/^Unseal Key [0-9]+:/   {print $NF}' >  "$WORK/keys"
       printf '%s\n' "$INIT_OUT" | awk '/^Recovery Key [0-9]+:/ {print $NF}' >> "$WORK/keys"
-      printf '%s\n' "$INIT_OUT" | awk '/^Initial Root Token:/  {print $NF}'  >  "$WORK/root-token"
+      # No trailing newline: this file becomes .data.root-token verbatim, and a
+      # consumer that injects it with secretKeyRef gets whatever is in it. The
+      # bao CLI refuses a token with a newline -- "configured Vault token
+      # contains non-printable characters and cannot be used" -- which is how
+      # the restore Job failed before this was fixed. Command substitution
+      # strips the newline awk adds.
+      printf '%s' "$(printf '%s\n' "$INIT_OUT" | awk '/^Initial Root Token:/ {print $NF}')" > "$WORK/root-token"
       INIT_OUT=""; unset INIT_OUT
 
       [ -s "$WORK/keys" ]       || die "could not parse any ${KEY_KIND} keys out of the init output"

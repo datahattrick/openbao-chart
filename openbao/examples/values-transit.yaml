@@ -1,8 +1,8 @@
 # Environment: non-Azure — auto-unseal against another OpenBao's transit engine.
 #
-#   helm upgrade --install openbao charts/openbao-platform -n openbao \
-#     -f charts/openbao-platform/values-prod.yaml \
-#     -f charts/openbao-platform/values-transit.yaml
+#   helm upgrade --install openbao openbao/ -n openbao \
+#     -f openbao/examples/values-prod.yaml \
+#     -f openbao/examples/values-transit.yaml
 #
 # `transit` is NOT one of the seals removed in v2.7.0, so no plugin is needed
 # here. That asymmetry is the reason the two environments are configured
