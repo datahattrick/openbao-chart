@@ -860,12 +860,16 @@ openbao:
         # MUST equal seal.type to shadow the built-in.
         name: azurekeyvault
 
-        #   oci        OpenBao pulls the image and extracts the binary,
-        #              verifying sha256sum. Point `image` at your own registry
-        #              for an airgap.
         #   preloaded  The binary is already in `directory`, put there by an
-        #              initContainer or baked into a derived image.
-        source: oci
+        #              initContainer (see `fetch` below) or baked into a
+        #              derived image. Artifactory serves the release tarball
+        #              from a generic repo, and the fetch step authenticates
+        #              with the pod's own ServiceAccount.
+        #   oci        OpenBao pulls the image itself and extracts the binary.
+        #              Fewer moving parts on paper, but the credential and CA
+        #              plumbing all lands inside the server process: see
+        #              registryCA and registryAuth below.
+        source: preloaded
 
         # source: oci — a multi-arch index; OpenBao selects the right platform.
         #
@@ -896,12 +900,68 @@ openbao:
         # Defaults to binaryName.
         command: ""
 
+        # -------------------------------------------------------------------
+        # source: preloaded — fetch the release tarball before OpenBao starts
+        # -------------------------------------------------------------------
+        # Drives the `fetch-seal-plugin` initContainer. That container lives in
+        # openbao.server.extraInitContainers, which the subchart renders with
+        # `tpl`, so it reads these values directly and cannot drift from them.
+        # A worked copy is in examples/values-azure.yaml; the render fails if
+        # this is enabled and the container is missing.
+        fetch:
+          enabled: false
+          # Full URL of the tarball in Artifactory's generic repo.
+          url: ""
+
+          image: docker.io/curlimages/curl:8.11.1
+          imagePullPolicy: IfNotPresent
+          # NOTE: resources are set on the initContainer itself, not here.
+          # extraInitContainers is a values FILE that must parse as YAML before
+          # tpl runs, so a map cannot be templated into it — only scalars can.
+
+          auth:
+            #   none            anonymous download
+            #   bearerSecret    a long-lived token from a Secret
+            #   serviceAccount  the pod's own ServiceAccount, projected with an
+            #                   explicit audience and exchanged for an
+            #                   Artifactory access token. No stored credential.
+            method: none
+
+            bearerSecret:
+              name: ""
+              key: token
+
+            serviceAccount:
+              # Audience the token is minted for. MUST match the audience the
+              # Artifactory OIDC provider is configured to accept — the default
+              # API-server audience will not do, which is why this projects its
+              # own token rather than reusing the auto-mounted one.
+              audience: ""
+              # Kubernetes enforces a 600s floor. The token is used once, at
+              # startup, so there is no reason to go long.
+              expirationSeconds: 3600
+              # Where the projected token is mounted in the initContainer.
+              mountPath: /var/run/secrets/artifactory
+
+              # JFrog OIDC token exchange (RFC 8693). The projected token is
+              # POSTed here and the `access_token` from the reply is used as the
+              # Bearer for the download.
+              #   https://<artifactory>/access/api/v1/oidc/token
+              # Leave EMPTY to send the projected token straight through as the
+              # Bearer instead, for a gateway that accepts it directly.
+              tokenUrl: ""
+              # The OIDC provider's name in Artifactory. Required with tokenUrl;
+              # the identity mapping on it is what grants read on the repo.
+              providerName: ""
+
         # REQUIRED. OpenBao verifies the binary against it. Published in
         # checksums-kms-<provider>.txt, per-architecture — an arm64 node needs
         # the arm64 line.
         sha256sum: ""
 
-        # source: oci — private CA for the registry `image` lives on.
+        # Private CA for Artifactory. Used by BOTH sources: source=oci needs it
+        # in the server's trust store (SSL_CERT_DIR, below), source=preloaded
+        # passes it to curl in the fetch initContainer as CURL_CA_BUNDLE.
         #
         # The SERVER process performs the pull, and there is no per-plugin CA
         # option, so the CA has to be in its trust store. Without it startup
@@ -923,7 +983,8 @@ openbao:
           # CA's mount is a Secret that cannot be merged with a ConfigMap.
           mountPath: /openbao/tls/registry
 
-        # source: oci — credentials for that registry.
+        # source: oci ONLY — credentials for that registry. The preloaded path
+        # authenticates in the initContainer instead; see `fetch.auth`.
         #
         # NOT an imagePullSecret: the kubelet is not doing this pull, the
         # server process is, and it reads Docker/Podman config files. Of the
