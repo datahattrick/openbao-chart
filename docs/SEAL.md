@@ -79,6 +79,45 @@ Same binary, same bytes, same checksum — packaged under different names:
 | OCI image `ghcr.io/openbao/openbao-plugin-kms-azure:v0.1.0` | `openbao-plugin-kms-azure` |
 | Release tarball `openbao-plugin-kms-azure_linux_amd64_v1.tar.gz` | `openbao-plugin-kms-azure_linux_amd64_v1` |
 
+### The image reference is split in two
+
+`image` takes the repository **without a tag**; the tag goes in `version`.
+OpenBao assembles the reference itself as `image` + `:` + `version`, so leaving
+the tag on `image` yields a second colon and the server refuses to start:
+
+```
+image and version do not form a valid image reference
+```
+
+```hcl
+plugin "kms" "azurekeyvault" {
+  image       = "artifactory.example.com/openbao/openbao-plugin-kms-azure"
+  version     = "v0.1.0"
+  binary_name = "openbao-plugin-kms-azure"
+  sha256sum   = "e46a6d13…"
+}
+```
+
+A registry **port** — `artifactory.example.com:5000/openbao/…` — is fine; only a
+trailing `:tag` is not. The chart checks the last path segment only, and
+`version` is required in both delivery modes, not just `oci`.
+
+### `plugin_auto_download` defaults to false
+
+So does `plugin_auto_register`. With `source: oci` the plugin directory is an
+empty `emptyDir` and nothing else populates it, so without
+`seal.autoDownload: true` the server never contacts the registry and the seal
+fails as "plugin not found" — the config file looks complete either way. The
+chart fails the render on that combination.
+
+`autoRegister` is a separate matter: a `kms` plugin is usable at startup without
+appearing in the plugin catalog, so it does not need registering. It is only
+what makes `plugin.args` and `plugin.env` take effect, and the chart fails the
+render if either is set without it.
+
+`downloadBehavior` renders `plugin_download_behavior`, whose accepted values are
+`fail` and `warn`.
+
 The published `checksums-kms-azure.txt` line refers to the **tarball** name.
 Verified by extracting both and comparing hashes — identical
 (`e46a6d13…`). The chart models this as two values: `binaryName` (OCI /
@@ -193,11 +232,14 @@ nor a second OpenBao. What was checked directly:
 
 - both overlays render; the `seal`, `plugin`, `plugin_directory` stanzas emit
   correctly, and `plugin_directory` is omitted when no plugin is registered
+- the split `image`/`version` reference, `plugin_auto_download` and
+  `plugin_auto_register` were corrected against the upstream declarative-plugin
+  docs after a live `image and version do not form a valid image reference`
 - the plugin OCI image and release tarball were both fetched and their binaries
   hashed — identical bytes, and the published checksum matches
 - the fetch script's download → `sha256sum -c` → `install` logic was executed
   against the real artifact; a tampered binary is correctly refused
-- 10 negative tests against the validation rules, all caught
+- 15 negative tests against the validation rules, all caught
 
 Not verified without Azure: the federated token exchange and an actual
 wrap/unwrap against Key Vault.

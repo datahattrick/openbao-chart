@@ -824,8 +824,21 @@ openbao:
       # Plugin directory. Must be a real readable directory, not a symlink, or
       # the server fails to start.
       directory: /openbao/plugins
-      # fail | continue — on a failed OCI plugin download.
+      # fail | warn — on a failed OCI plugin download. "fail" aborts startup.
       downloadBehavior: fail
+
+      # plugin_auto_download. OpenBao's DEFAULT IS FALSE: without this the
+      # server never contacts the registry, the binary never lands in
+      # `directory`, and the seal fails as "plugin not found". Required for
+      # source: oci; pointless for source: preloaded, where the initContainer
+      # has already put the binary there.
+      autoDownload: true
+
+      # plugin_auto_register. A kms plugin does NOT need it — it is usable at
+      # startup without appearing in the plugin catalog. It is only what makes
+      # plugin.args and plugin.env take effect, so the render fails if either
+      # is set while this is false.
+      autoRegister: false
 
       plugin:
         # Register an external plugin. Required for azurekeyvault from v2.7.0,
@@ -846,7 +859,16 @@ openbao:
         source: oci
 
         # source: oci — a multi-arch index; OpenBao selects the right platform.
-        image: ""              # e.g. artifactory.example.com/openbao/openbao-plugin-kms-azure:v0.1.0
+        #
+        # WITHOUT A TAG. OpenBao joins `image` and `version` itself, so a tag
+        # here is a second colon and startup fails with
+        #   "image and version do not form a valid image reference"
+        # A registry port (host:5000/...) is fine; only a trailing :tag is not.
+        image: ""              # e.g. artifactory.example.com/openbao/openbao-plugin-kms-azure
+
+        # REQUIRED whenever the plugin is registered, both sources. For
+        # source: oci this is the image tag.
+        version: ""            # e.g. v0.1.0
 
         # The same binary is packaged under two different names: this one in
         # the OCI image, `archiveBinary` in the release tarball. Using the wrong
@@ -1231,6 +1253,11 @@ openbao:
           # naming one that is not mounted fails startup for no reason.
           plugin_directory         = "{{ $seal.directory }}"
           plugin_download_behavior = "{{ $seal.downloadBehavior }}"
+          # Both default to FALSE upstream. Without auto_download nothing ever
+          # fetches the image and the seal fails as "plugin not found";
+          # auto_register is what makes args/env below take effect.
+          plugin_auto_download     = {{ $seal.autoDownload | default false }}
+          plugin_auto_register     = {{ $seal.autoRegister | default false }}
 
           # External seal plugin. The built-in cloud seals are removed in
           # v2.7.0; a plugin of the SAME NAME shadows the built-in and takes
@@ -1240,11 +1267,14 @@ openbao:
           # a mirror or Artifactory safe.
           plugin "{{ $seal.plugin.type | default "kms" }}" "{{ $seal.plugin.name }}" {
             {{- if eq ($seal.plugin.source | default "preloaded") "oci" }}
+            # image carries NO tag: OpenBao builds the reference as
+            # image + ":" + version, so a tag here makes it invalid.
             image       = "{{ $seal.plugin.image }}"
             binary_name = "{{ $seal.plugin.binaryName }}"
             {{- else }}
             command     = "{{ $seal.plugin.command | default $seal.plugin.binaryName }}"
             {{- end }}
+            version     = "{{ $seal.plugin.version }}"
             sha256sum   = "{{ $seal.plugin.sha256sum }}"
             {{- with $seal.plugin.args }}
             args        = {{ toJson . }}

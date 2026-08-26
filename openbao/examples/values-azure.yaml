@@ -45,7 +45,14 @@ openbao:
     seal:
       type: azurekeyvault
       directory: /openbao/plugins
+      # fail | warn
       downloadBehavior: fail
+      # plugin_auto_download. Defaults to FALSE upstream, and source: oci is
+      # useless without it — nothing would ever fetch the image.
+      autoDownload: true
+      # A kms plugin does not need catalog registration; leave it off unless
+      # you set plugin.args or plugin.env, which are ignored without it.
+      autoRegister: false
 
       azurekeyvault:
         vaultName: CHANGEME-kv
@@ -82,7 +89,15 @@ openbao:
         # Upstream publishes a multi-arch index at
         #   ghcr.io/openbao/openbao-plugin-kms-azure:v0.1.0
         # Mirror that into Artifactory and point this at your copy.
-        image: CHANGEME-artifactory.example.com/openbao/openbao-plugin-kms-azure:v0.1.0
+        #
+        # NOTE THE MISSING TAG. OpenBao assembles the reference itself as
+        # image + ":" + version; leaving the tag on `image` produces
+        #   image and version do not form a valid image reference
+        # at startup. A registry PORT is fine — only a trailing :tag is not.
+        image: CHANGEME-artifactory.example.com/openbao/openbao-plugin-kms-azure
+        # The tag, and a required field of the plugin stanza in both delivery
+        # modes. Keep it in step with sha256sum below.
+        version: v0.1.0
 
         # Name inside the OCI image, and the installed name.
         binaryName: openbao-plugin-kms-azure

@@ -336,11 +336,34 @@ naming the value to fix.
     {{- if not $seal.plugin.sha256sum }}
 {{- fail "openbao-platform: seal.plugin.enabled is true but seal.plugin.sha256sum is empty. OpenBao verifies the binary against it — it is the whole reason fetching from a mirror or Artifactory is safe. Take it from checksums-kms-<provider>.txt on the plugin release." }}
     {{- end }}
-    {{- if and (eq ($seal.plugin.source | default "preloaded") "oci") (not $seal.plugin.image) }}
-{{- fail "openbao-platform: seal.plugin.source is \"oci\" but seal.plugin.image is empty." }}
+    {{/* `version` is required in BOTH plugin forms, and for source=oci it is
+         also the image tag — OpenBao builds the reference itself as
+         image + ":" + version. */}}
+    {{- if not $seal.plugin.version }}
+{{- fail "openbao-platform: seal.plugin.enabled is true but seal.plugin.version is empty. It is a required field of the plugin stanza, and for source=oci it supplies the image tag — OpenBao joins image and version itself. Set it to the plugin release, e.g. \"v0.1.0\"." }}
     {{- end }}
     {{- if not (has ($seal.plugin.source | default "preloaded") (list "oci" "preloaded")) }}
 {{- fail (printf "openbao-platform: seal.plugin.source is %q; supported values are \"oci\" and \"preloaded\"." $seal.plugin.source) }}
+    {{- end }}
+    {{- if eq ($seal.plugin.source | default "preloaded") "oci" }}
+      {{- if not $seal.plugin.image }}
+{{- fail "openbao-platform: seal.plugin.source is \"oci\" but seal.plugin.image is empty." }}
+      {{- end }}
+      {{/* The tag belongs in `version`. Only the LAST path segment can hold
+           one — a colon earlier is a registry port, which is legitimate. */}}
+      {{- $ref := last (splitList "/" $seal.plugin.image) }}
+      {{- if or (contains ":" $ref) (contains "@" $ref) }}
+{{- fail (printf "openbao-platform: seal.plugin.image is %q, but it must carry NO tag or digest — OpenBao builds the reference as image + \":\" + version, so a tag here makes it a second colon and the server fails to start with `image and version do not form a valid image reference`. Move the tag to seal.plugin.version." $seal.plugin.image) }}
+      {{- end }}
+      {{- if not $seal.autoDownload }}
+{{- fail "openbao-platform: seal.plugin.source is \"oci\" but seal.autoDownload is false. `plugin_auto_download` defaults to FALSE in OpenBao, so the server would never contact the registry, nothing would land in the plugin directory, and the seal would fail as \"plugin not found\". Set seal.autoDownload=true, or use source=preloaded and fetch the binary with an initContainer." }}
+      {{- end }}
+    {{- end }}
+    {{- if not (has ($seal.downloadBehavior | default "fail") (list "fail" "warn")) }}
+{{- fail (printf "openbao-platform: seal.downloadBehavior is %q; it must be \"fail\" or \"warn\" (it renders plugin_download_behavior). Anything else is rejected by the server at startup." $seal.downloadBehavior) }}
+    {{- end }}
+    {{- if and (or $seal.plugin.args $seal.plugin.env) (not $seal.autoRegister) }}
+{{- fail "openbao-platform: seal.plugin.args/env are set but seal.autoRegister is false. Those two fields are only applied when the plugin is auto-registered into the catalog, so as configured they would be written to the config file and silently ignored. Set seal.autoRegister=true, or drop the args/env." }}
     {{- end }}
     {{/* the plugin directory has to actually exist in the pod */}}
     {{- $mounts := ($server.volumeMounts) | default list }}
