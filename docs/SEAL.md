@@ -118,6 +118,61 @@ render if either is set without it.
 `downloadBehavior` renders `plugin_download_behavior`, whose accepted values are
 `fail` and `warn`.
 
+### A registry behind a private CA
+
+The **server process** performs the pull, and the plugin stanza has no CA option
+of its own, so the registry's CA has to be in OpenBao's trust store. Missing, it
+surfaces as `x509: certificate signed by unknown authority` from the plugin
+download rather than from the seal.
+
+`seal.plugin.registryCA` declares it. Three things have to agree, and because
+Helm cannot template subchart values none of them follows from the others — the
+chart fails the render if any is missing:
+
+```yaml
+openbao:
+  server:
+    seal:
+      plugin:
+        registryCA:
+          configMap: artifactory-ca-bundle
+          key: ca-bundle.crt
+          mountPath: /openbao/tls/registry
+
+    volumes:
+      - name: registry-ca
+        configMap: { name: artifactory-ca-bundle }
+    volumeMounts:
+      - { name: registry-ca, mountPath: /openbao/tls/registry, readOnly: true }
+
+    extraEnvironmentVars:
+      SSL_CERT_DIR: /openbao/tls/internal:/openbao/tls/registry
+```
+
+Give it **its own directory**: `SSL_CERT_DIR` reads a directory whole, and the
+backend CA's mount is a Secret that cannot be merged with a ConfigMap.
+
+> **`SSL_CERT_DIR` replaces, it does not extend.** Go reads only the directories
+> named there — the default `/etc/ssl/certs` and friends drop out — so the list
+> is colon-separated and every directory you need must appear in it. Losing
+> `/openbao/tls/internal` while adding the registry breaks the http audit
+> device, which takes no CA option either, and a failing audit device stops
+> OpenBao serving requests. The chart checks for that entry too.
+>
+> Public roots are unaffected: they come from a default bundle **file**
+> (`/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem` on the UBI image) that
+> `SSL_CERT_DIR` does not touch. `SSL_CERT_FILE` *would* replace it — never set
+> that one.
+
+A ConfigMap volume presents each key as a symlink into `..data/`. Go follows
+those (it only skips symlinks pointing within the same directory), so the bundle
+is read normally.
+
+Registry **credentials** are a separate matter: OpenBao reads them from
+`~/.docker/config.json`, `$DOCKER_CONFIG/config.json`, `$REGISTRY_AUTH_FILE` or
+`$XDG_RUNTIME_DIR/containers/auth.json` — an imagePullSecret does not reach it,
+because the pull is not Kubernetes'.
+
 The published `checksums-kms-azure.txt` line refers to the **tarball** name.
 Verified by extracting both and comparing hashes — identical
 (`e46a6d13…`). The chart models this as two values: `binaryName` (OCI /
@@ -235,11 +290,14 @@ nor a second OpenBao. What was checked directly:
 - the split `image`/`version` reference, `plugin_auto_download` and
   `plugin_auto_register` were corrected against the upstream declarative-plugin
   docs after a live `image and version do not form a valid image reference`
+- the registry-CA wiring renders, and all four ways of getting it half-right
+  fail the render; the trust mechanism is read from Go's `crypto/x509`, not
+  tested against a private registry
 - the plugin OCI image and release tarball were both fetched and their binaries
   hashed — identical bytes, and the published checksum matches
 - the fetch script's download → `sha256sum -c` → `install` logic was executed
   against the real artifact; a tampered binary is correctly refused
-- 15 negative tests against the validation rules, all caught
+- 19 negative tests against the validation rules, all caught
 
 Not verified without Azure: the federated token exchange and an actual
 wrap/unwrap against Key Vault.

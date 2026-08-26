@@ -114,6 +114,20 @@ openbao:
         #   https://github.com/openbao/openbao-plugins/releases/tag/kms-azure-v0.1.0
         sha256sum: e46a6d13ab427b594c89e58b002db6bbb6d61557f5de8a599557c76827deef0d
 
+        # Artifactory behind a private CA. The SERVER process performs the
+        # pull and there is no per-plugin CA option, so the bundle has to be in
+        # its trust store or startup fails with
+        #   x509: certificate signed by unknown authority
+        # reported by the plugin download, not by the seal.
+        #
+        # This declares the intent; the volume, the volumeMount and the
+        # SSL_CERT_DIR entry below are what actually do it, and the render
+        # fails if any of the three is missing.
+        registryCA:
+          configMap: CHANGEME-artifactory-ca-bundle
+          key: ca-bundle.crt
+          mountPath: /openbao/tls/registry
+
     # The plugin directory must be a real, writable, non-symlink directory.
     # An emptyDir is enough — the binary is re-fetched or re-extracted on every
     # start, and sha256sum is verified each time.
@@ -128,6 +142,11 @@ openbao:
       # extract-from-the-pod flow.
       - name: plugins
         emptyDir: {}
+      # The registry's CA. A ConfigMap volume presents each key as a symlink
+      # into ..data/, which Go follows, so SSL_CERT_DIR reads it correctly.
+      - name: registry-ca
+        configMap:
+          name: CHANGEME-artifactory-ca-bundle
       # Writable scratch for the fetch initContainer, which runs with
       # readOnlyRootFilesystem.
       - name: tmp
@@ -136,6 +155,15 @@ openbao:
       - { name: tls-internal, mountPath: /openbao/tls/internal, readOnly: true }
       - { name: tls-server,   mountPath: /openbao/tls/server,   readOnly: true }
       - { name: plugins,      mountPath: /openbao/plugins }
+      - { name: registry-ca,  mountPath: /openbao/tls/registry, readOnly: true }
+
+    # SSL_CERT_DIR REPLACES Go's default certificate directories rather than
+    # extending them, so this is a colon-separated list and BOTH entries have
+    # to be here: dropping the backend CA breaks the http audit device, which
+    # stops OpenBao serving requests. Public roots are unaffected — they come
+    # from a default bundle FILE that SSL_CERT_DIR does not touch.
+    extraEnvironmentVars:
+      SSL_CERT_DIR: /openbao/tls/internal:/openbao/tls/registry
 
     # ----------------------------------------------------------------------
     # DELIVERY (b): fetch from an Artifactory generic repo.

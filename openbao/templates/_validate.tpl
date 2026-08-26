@@ -163,6 +163,16 @@ naming the value to fix.
   {{- if and (($ad.http).tls) (not (include "obp.tlsEnabled" .)) }}
 {{- fail "openbao-platform: openbao.server.auditDevices.http.tls is true but global.tlsDisable is set, so there is no backend CA to issue the proxy a certificate or for OpenBao to verify it against. Turn the hop's TLS off too, or leave global.tlsDisable=false." }}
   {{- end }}
+  {{/* The device has no CA option: it trusts whatever is in the process store,
+       which for the backend CA means SSL_CERT_DIR. That variable REPLACES Go's
+       default directory list, so appending a second entry and losing this one
+       is a one-character mistake that breaks every audit write. */}}
+  {{- if ($ad.http).tls }}
+    {{- $certDir := (($server.extraEnvironmentVars).SSL_CERT_DIR) | default "" }}
+    {{- if not (has .Values.tls.internal.mountPath (splitList ":" $certDir)) }}
+{{- fail (printf "openbao-platform: the http audit device speaks TLS to the audit proxy, but openbao.server.extraEnvironmentVars.SSL_CERT_DIR is %q and does not list the backend CA's mount %q. The device takes no CA option, so OpenBao could not verify the proxy and every audit write would fail — which stops OpenBao serving requests. SSL_CERT_DIR is a colon-separated list and REPLACES Go's defaults, so keep this entry in it when you add others." $certDir .Values.tls.internal.mountPath) }}
+    {{- end }}
+  {{- end }}
   {{- if ne (int ($ad.http).port) (int .Values.auditProxy.listen.port) }}
 {{- fail (printf "openbao-platform: openbao.server.auditDevices.http.port is %v but auditProxy.listen.port is %v. Audit records would be posted to a closed port and OpenBao would fail to start." ($ad.http).port .Values.auditProxy.listen.port) }}
   {{- end }}
@@ -357,6 +367,31 @@ naming the value to fix.
       {{- end }}
       {{- if not $seal.autoDownload }}
 {{- fail "openbao-platform: seal.plugin.source is \"oci\" but seal.autoDownload is false. `plugin_auto_download` defaults to FALSE in OpenBao, so the server would never contact the registry, nothing would land in the plugin directory, and the seal would fail as \"plugin not found\". Set seal.autoDownload=true, or use source=preloaded and fetch the binary with an initContainer." }}
+      {{- end }}
+      {{/* Private registry CA. The pull happens in the server process and has
+           no CA option of its own, so the bundle has to be mounted AND named
+           in SSL_CERT_DIR. Declaring the ConfigMap mounts nothing by itself —
+           Helm cannot template subchart values — so all three are checked. */}}
+      {{- $rca := ($seal.plugin.registryCA) | default dict }}
+      {{- if $rca.configMap }}
+        {{- $cmFound := false }}
+        {{- range ($server.volumes | default list) }}
+          {{- if eq ((.configMap).name | default "") $rca.configMap }}{{ $cmFound = true }}{{ end }}
+        {{- end }}
+        {{- if not $cmFound }}
+{{- fail (printf "openbao-platform: seal.plugin.registryCA.configMap is %q but no entry in openbao.server.volumes mounts that ConfigMap. The image pull would fall back to public roots and fail with `x509: certificate signed by unknown authority`. Add the volume (and its volumeMount at %s)." $rca.configMap $rca.mountPath) }}
+        {{- end }}
+        {{- $mFound := false }}
+        {{- range ($server.volumeMounts | default list) }}
+          {{- if eq (.mountPath | default "") $rca.mountPath }}{{ $mFound = true }}{{ end }}
+        {{- end }}
+        {{- if not $mFound }}
+{{- fail (printf "openbao-platform: no entry in openbao.server.volumeMounts mounts the registry CA at %q. The ConfigMap is declared and attached to the pod but never appears in the filesystem." $rca.mountPath) }}
+        {{- end }}
+        {{- $certDir := (($server.extraEnvironmentVars).SSL_CERT_DIR) | default "" }}
+        {{- if not (has $rca.mountPath (splitList ":" $certDir)) }}
+{{- fail (printf "openbao-platform: the registry CA is mounted at %q but openbao.server.extraEnvironmentVars.SSL_CERT_DIR is %q, which does not list it. Go reads only the directories named there, so the bundle would sit on disk untrusted. Make it a colon-separated list that includes BOTH the backend CA's mount and %s." $rca.mountPath $certDir $rca.mountPath) }}
+        {{- end }}
       {{- end }}
     {{- end }}
     {{- if not (has ($seal.downloadBehavior | default "fail") (list "fail" "warn")) }}

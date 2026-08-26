@@ -634,9 +634,9 @@ auditProxy:
   # they disagree, because one side would speak plaintext to a TLS listener.
   #
   # The http audit device takes no CA option, so OpenBao validates this hop
-  # against its process trust store. openbao.server.extraEnvironmentVars sets
-  # SSL_CERT_DIR to the backend CA's mount, which Go ADDS to the system roots,
-  # so public CAs keep working for the seal and GitLab OIDC.
+  # against its process trust store. openbao.server.extraEnvironmentVars puts
+  # the backend CA's mount in SSL_CERT_DIR; public roots keep working for the
+  # seal and GitLab OIDC because Go reads its default bundle file separately.
   tls:
     enabled: true
     # Issued by the BACKEND CA — the proxy is a backend component. Requires
@@ -735,11 +735,20 @@ openbao:
     logLevel: info
     logFormat: json
 
-    # Go ADDS every certificate in these directories to the system roots rather
-    # than replacing them, so the backend CA becomes trusted for outbound TLS
-    # while public CAs keep working. This is what lets the http audit device —
-    # which takes no CA option of its own — POST over https to the audit proxy.
-    # KEEP IN SYNC with tls.internal.mountPath.
+    # Trust for OpenBao's OUTBOUND TLS: the http audit device (which takes no
+    # CA option of its own), and the registry the seal plugin image is pulled
+    # from. Both validate against the process trust store, nothing narrower.
+    #
+    # SSL_CERT_DIR REPLACES Go's default certificate DIRECTORIES; public roots
+    # survive only because Go separately reads a default bundle FILE
+    # (/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem on the UBI image), which
+    # SSL_CERT_FILE would replace — so never set that one. Two consequences:
+    # the list is colon-separated and every directory you need must be in it,
+    # and dropping tls.internal.mountPath from it silently breaks the audit hop.
+    #
+    # KEEP IN SYNC with tls.internal.mountPath and, when the seal plugin is
+    # pulled from a registry behind a private CA, seal.plugin.registryCA.mountPath.
+    # The render fails if either is missing.
     extraEnvironmentVars:
       SSL_CERT_DIR: /openbao/tls/internal
 
@@ -891,6 +900,28 @@ openbao:
         # checksums-kms-<provider>.txt, per-architecture — an arm64 node needs
         # the arm64 line.
         sha256sum: ""
+
+        # source: oci — private CA for the registry `image` lives on.
+        #
+        # The SERVER process performs the pull, and there is no per-plugin CA
+        # option, so the CA has to be in its trust store. Without it startup
+        # fails with `x509: certificate signed by unknown authority` from the
+        # download, not from the seal.
+        #
+        # Setting configMap here does not itself mount anything — Helm cannot
+        # template subchart values. It declares the intent, and the render then
+        # fails unless openbao.server.volumes, .volumeMounts and
+        # .extraEnvironmentVars.SSL_CERT_DIR all agree. See values-azure.yaml.
+        registryCA:
+          # ConfigMap holding the PEM bundle. Empty -> public roots only.
+          configMap: ""
+          # Key inside it. Every key in the ConfigMap is read, so this only
+          # documents which one carries the bundle.
+          key: ca-bundle.crt
+          # Mount point, and the entry to add to SSL_CERT_DIR. Its own
+          # directory: SSL_CERT_DIR reads a whole directory, and the backend
+          # CA's mount is a Secret that cannot be merged with a ConfigMap.
+          mountPath: /openbao/tls/registry
 
         args: []
         env: []
