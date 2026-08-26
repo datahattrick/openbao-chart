@@ -168,10 +168,67 @@ A ConfigMap volume presents each key as a symlink into `..data/`. Go follows
 those (it only skips symlinks pointing within the same directory), so the bundle
 is read normally.
 
-Registry **credentials** are a separate matter: OpenBao reads them from
-`~/.docker/config.json`, `$DOCKER_CONFIG/config.json`, `$REGISTRY_AUTH_FILE` or
-`$XDG_RUNTIME_DIR/containers/auth.json` — an imagePullSecret does not reach it,
-because the pull is not Kubernetes'.
+### Registry credentials
+
+An **imagePullSecret does not reach this pull** — the kubelet is not making it.
+The server process reads Docker/Podman config files, in this order:
+
+1. `$HOME/.docker/config.json`
+2. `$DOCKER_CONFIG/config.json`
+3. `$REGISTRY_AUTH_FILE`
+4. `$XDG_RUNTIME_DIR/containers/auth.json`, then `$XDG_CONFIG_HOME/containers/auth.json`
+
+Finding none of them, it pulls **anonymously** rather than failing, so every way
+of getting this wrong looks identical from the outside: a 401 or 403 naming the
+registry, never the missing Secret.
+
+Use `DOCKER_CONFIG`. It is the only entry that wins deterministically — once any
+Docker config is found, the loader reads `config.Load($DOCKER_CONFIG)`, so
+whatever that variable points at is what gets used. `REGISTRY_AUTH_FILE` is
+consulted only when no Docker config was found anywhere.
+
+```yaml
+openbao:
+  server:
+    seal:
+      plugin:
+        registryAuth:
+          secretName: artifactory-pull
+          key: .dockerconfigjson
+          mountPath: /openbao/.docker
+
+    volumes:
+      - name: registry-auth
+        secret:
+          secretName: artifactory-pull
+          defaultMode: 0400
+          items:
+            - key: .dockerconfigjson    # `items` is NOT optional — see below
+              path: config.json
+    volumeMounts:
+      - { name: registry-auth, mountPath: /openbao/.docker, readOnly: true }
+
+    extraEnvironmentVars:
+      DOCKER_CONFIG: /openbao/.docker   # the DIRECTORY, not the file
+```
+
+The Secret is an ordinary `kubernetes.io/dockerconfigjson`, so an existing
+imagePullSecret can be reused as-is:
+
+```sh
+kubectl create secret docker-registry artifactory-pull -n openbao \
+  --docker-server=artifactory.example.com \
+  --docker-username=… --docker-password=…
+```
+
+> **`items` is not optional.** The loader opens `<DOCKER_CONFIG>/config.json` by
+> that exact filename. A Secret mounted plainly produces a file named after its
+> key — `.dockerconfigjson` — which is never found, and not found means
+> anonymous. The rename is what makes the mount work, and the chart fails the
+> render without it.
+
+`DOCKER_CONFIG` names the **directory**; pointing it at the file finds nothing.
+The chart checks that too, along with the volume and the volumeMount.
 
 The published `checksums-kms-azure.txt` line refers to the **tarball** name.
 Verified by extracting both and comparing hashes — identical
@@ -290,14 +347,15 @@ nor a second OpenBao. What was checked directly:
 - the split `image`/`version` reference, `plugin_auto_download` and
   `plugin_auto_register` were corrected against the upstream declarative-plugin
   docs after a live `image and version do not form a valid image reference`
-- the registry-CA wiring renders, and all four ways of getting it half-right
-  fail the render; the trust mechanism is read from Go's `crypto/x509`, not
+- the registry-CA and credential wiring render, and all nine ways of getting
+  either half-right fail the render; the trust and credential mechanisms are
+  read from Go's `crypto/x509` and go-containerregistry's `authn` keychain, not
   tested against a private registry
 - the plugin OCI image and release tarball were both fetched and their binaries
   hashed — identical bytes, and the published checksum matches
 - the fetch script's download → `sha256sum -c` → `install` logic was executed
   against the real artifact; a tampered binary is correctly refused
-- 19 negative tests against the validation rules, all caught
+- 24 negative tests against the validation rules, all caught
 
 Not verified without Azure: the federated token exchange and an actual
 wrap/unwrap against Key Vault.

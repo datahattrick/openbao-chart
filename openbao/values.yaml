@@ -923,6 +923,36 @@ openbao:
           # CA's mount is a Secret that cannot be merged with a ConfigMap.
           mountPath: /openbao/tls/registry
 
+        # source: oci — credentials for that registry.
+        #
+        # NOT an imagePullSecret: the kubelet is not doing this pull, the
+        # server process is, and it reads Docker/Podman config files. Of the
+        # four places it looks, DOCKER_CONFIG is the only one that wins
+        # deterministically — $HOME/.docker/config.json is consulted first, and
+        # REGISTRY_AUTH_FILE only if no Docker config was found at all.
+        #
+        # With no credentials found the pull is attempted ANONYMOUSLY rather
+        # than failing, so a private repo answers 401/403 and the error names
+        # the registry, not the missing Secret.
+        #
+        # Declaring secretName mounts nothing by itself; the render fails
+        # unless openbao.server.volumes, .volumeMounts and
+        # .extraEnvironmentVars.DOCKER_CONFIG agree. See values-azure.yaml.
+        registryAuth:
+          # Secret holding the credentials. Normally a
+          # kubernetes.io/dockerconfigjson from
+          #   kubectl create secret docker-registry <name> \
+          #     --docker-server=... --docker-username=... --docker-password=...
+          # An existing imagePullSecret can be reused as-is.
+          secretName: ""
+          # Key inside it. `.dockerconfigjson` is what that Secret type uses.
+          key: .dockerconfigjson
+          # Directory DOCKER_CONFIG points at. The volume MUST rename the key
+          # to `config.json` with `items` — the loader looks for exactly that
+          # filename, and a Secret mounted without items produces a file named
+          # after the key, which is silently not found.
+          mountPath: /openbao/.docker
+
         args: []
         env: []
 

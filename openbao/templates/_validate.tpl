@@ -393,6 +393,42 @@ naming the value to fix.
 {{- fail (printf "openbao-platform: the registry CA is mounted at %q but openbao.server.extraEnvironmentVars.SSL_CERT_DIR is %q, which does not list it. Go reads only the directories named there, so the bundle would sit on disk untrusted. Make it a colon-separated list that includes BOTH the backend CA's mount and %s." $rca.mountPath $certDir $rca.mountPath) }}
         {{- end }}
       {{- end }}
+      {{/* Registry credentials. The credential loader checks
+           $HOME/.docker/config.json, then DOCKER_CONFIG, then
+           REGISTRY_AUTH_FILE, then the podman paths, and falls back to an
+           ANONYMOUS pull rather than an error — so every way of getting this
+           wrong surfaces as a 401 from the registry. */}}
+      {{- $rau := ($seal.plugin.registryAuth) | default dict }}
+      {{- if $rau.secretName }}
+        {{- $authVol := dict }}
+        {{- range ($server.volumes | default list) }}
+          {{- if eq ((.secret).secretName | default "") $rau.secretName }}{{ $authVol = . }}{{ end }}
+        {{- end }}
+        {{- if not $authVol }}
+{{- fail (printf "openbao-platform: seal.plugin.registryAuth.secretName is %q but no entry in openbao.server.volumes mounts that Secret. An imagePullSecret does not help here — the kubelet is not making this pull — so the plugin image would be fetched anonymously and the registry would answer 401." $rau.secretName) }}
+        {{- end }}
+        {{/* The loader opens <DOCKER_CONFIG>/config.json by that exact name.
+             A Secret mounted without `items` produces a file named after the
+             key, which is simply not found — and not found means anonymous. */}}
+        {{- $renamed := false }}
+        {{- range ($authVol.secret).items | default list }}
+          {{- if and (eq (.key | default "") $rau.key) (eq (.path | default "") "config.json") }}{{ $renamed = true }}{{ end }}
+        {{- end }}
+        {{- if not $renamed }}
+{{- fail (printf "openbao-platform: the volume for Secret %q must project key %q to path `config.json`, because the credential loader opens <DOCKER_CONFIG>/config.json by that exact name. Mounted without `items` the file is called %q, is never found, and the pull silently falls back to anonymous. Add:\n  items:\n    - key: %s\n      path: config.json" $rau.secretName $rau.key $rau.key $rau.key) }}
+        {{- end }}
+        {{- $amFound := false }}
+        {{- range ($server.volumeMounts | default list) }}
+          {{- if eq (.mountPath | default "") $rau.mountPath }}{{ $amFound = true }}{{ end }}
+        {{- end }}
+        {{- if not $amFound }}
+{{- fail (printf "openbao-platform: no entry in openbao.server.volumeMounts mounts the registry credentials at %q." $rau.mountPath) }}
+        {{- end }}
+        {{- $dockerCfg := (($server.extraEnvironmentVars).DOCKER_CONFIG) | default "" }}
+        {{- if ne $dockerCfg $rau.mountPath }}
+{{- fail (printf "openbao-platform: the registry credentials are mounted at %q but openbao.server.extraEnvironmentVars.DOCKER_CONFIG is %q. DOCKER_CONFIG names the DIRECTORY holding config.json, and it is the only one of the four credential locations that wins deterministically — without it the loader finds nothing and pulls anonymously." $rau.mountPath $dockerCfg) }}
+        {{- end }}
+      {{- end }}
     {{- end }}
     {{- if not (has ($seal.downloadBehavior | default "fail") (list "fail" "warn")) }}
 {{- fail (printf "openbao-platform: seal.downloadBehavior is %q; it must be \"fail\" or \"warn\" (it renders plugin_download_behavior). Anything else is rejected by the server at startup." $seal.downloadBehavior) }}

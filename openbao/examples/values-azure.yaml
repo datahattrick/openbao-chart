@@ -128,6 +128,16 @@ openbao:
           key: ca-bundle.crt
           mountPath: /openbao/tls/registry
 
+        # Credentials for the same registry. NOT an imagePullSecret — the
+        # kubelet is not making this pull — though the same
+        # kubernetes.io/dockerconfigjson Secret can be reused for both.
+        # Without credentials the pull is attempted anonymously and Artifactory
+        # answers 401.
+        registryAuth:
+          secretName: CHANGEME-artifactory-pull
+          key: .dockerconfigjson
+          mountPath: /openbao/.docker
+
     # The plugin directory must be a real, writable, non-symlink directory.
     # An emptyDir is enough — the binary is re-fetched or re-extracted on every
     # start, and sha256sum is verified each time.
@@ -147,6 +157,17 @@ openbao:
       - name: registry-ca
         configMap:
           name: CHANGEME-artifactory-ca-bundle
+      # `items` is not optional. The credential loader opens
+      # <DOCKER_CONFIG>/config.json by that exact filename; mounted plainly the
+      # file would be called `.dockerconfigjson`, never be found, and the pull
+      # would fall back to anonymous.
+      - name: registry-auth
+        secret:
+          secretName: CHANGEME-artifactory-pull
+          defaultMode: 0400
+          items:
+            - key: .dockerconfigjson
+              path: config.json
       # Writable scratch for the fetch initContainer, which runs with
       # readOnlyRootFilesystem.
       - name: tmp
@@ -156,6 +177,7 @@ openbao:
       - { name: tls-server,   mountPath: /openbao/tls/server,   readOnly: true }
       - { name: plugins,      mountPath: /openbao/plugins }
       - { name: registry-ca,  mountPath: /openbao/tls/registry, readOnly: true }
+      - { name: registry-auth, mountPath: /openbao/.docker, readOnly: true }
 
     # SSL_CERT_DIR REPLACES Go's default certificate directories rather than
     # extending them, so this is a colon-separated list and BOTH entries have
@@ -164,6 +186,10 @@ openbao:
     # from a default bundle FILE that SSL_CERT_DIR does not touch.
     extraEnvironmentVars:
       SSL_CERT_DIR: /openbao/tls/internal:/openbao/tls/registry
+      # The DIRECTORY holding config.json, not the file. Of the four places
+      # credentials are looked for, this is the only one that wins
+      # deterministically.
+      DOCKER_CONFIG: /openbao/.docker
 
     # ----------------------------------------------------------------------
     # DELIVERY (b): fetch from an Artifactory generic repo.
