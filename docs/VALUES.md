@@ -73,6 +73,10 @@ perfectly valid, it just came from someone else's project. Bind at least
 ## Auto-unseal — still to decide
 
 `values-prod.yaml` leaves auto-unseal off, so it deploys on Shamir, meaning a
-human unseals every node after every restart. Layer `values-azure.yaml` or
-`values-transit.yaml` and set `bootstrap.init.autoUnseal: true`. See
-[SEAL.md](SEAL.md).
+human unseals every node after every restart. Layer `values-azure.yaml`,
+`values-azure-oci.yaml` or `values-transit.yaml` and set
+`bootstrap.init.autoUnseal: true`. See [SEAL.md](SEAL.md).
+
+Those overlays carry `CHANGEME-` placeholders of their own — the Key Vault, the
+Artifactory URLs and the OIDC provider — and every one of them fails the render
+rather than deploying half-configured.

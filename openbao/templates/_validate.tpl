@@ -412,6 +412,26 @@ naming the value to fix.
            ANONYMOUS pull rather than an error — so every way of getting this
            wrong surfaces as a 401 from the registry. */}}
       {{- $rau := ($seal.plugin.registryAuth) | default dict }}
+      {{- $ram := ($rau.mode) | default "secret" }}
+      {{- if not (has $ram (list "secret" "serviceAccount")) }}
+{{- fail (printf "openbao-platform: seal.plugin.registryAuth.mode is %q; supported values are \"secret\" (a dockerconfigjson Secret you created) and \"serviceAccount\" (the registry-login initContainer mints config.json from the pod's own token)." $ram) }}
+      {{- end }}
+      {{/* Both modes end at the same place: a config.json under DOCKER_CONFIG.
+           These two checks are what make the server actually read it. */}}
+      {{- if or (eq $ram "serviceAccount") $rau.secretName }}
+        {{- $amFound := false }}
+        {{- range ($server.volumeMounts | default list) }}
+          {{- if eq (.mountPath | default "") $rau.mountPath }}{{ $amFound = true }}{{ end }}
+        {{- end }}
+        {{- if not $amFound }}
+{{- fail (printf "openbao-platform: no entry in openbao.server.volumeMounts mounts the registry credentials at %q." $rau.mountPath) }}
+        {{- end }}
+        {{- $dockerCfg := (($server.extraEnvironmentVars).DOCKER_CONFIG) | default "" }}
+        {{- if ne $dockerCfg $rau.mountPath }}
+{{- fail (printf "openbao-platform: the registry credentials are mounted at %q but openbao.server.extraEnvironmentVars.DOCKER_CONFIG is %q. DOCKER_CONFIG names the DIRECTORY holding config.json, and it is the only one of the four credential locations that wins deterministically — without it the loader finds nothing and pulls anonymously." $rau.mountPath $dockerCfg) }}
+        {{- end }}
+      {{- end }}
+      {{- if eq $ram "secret" }}
       {{- if $rau.secretName }}
         {{- $authVol := dict }}
         {{- range ($server.volumes | default list) }}
@@ -430,16 +450,75 @@ naming the value to fix.
         {{- if not $renamed }}
 {{- fail (printf "openbao-platform: the volume for Secret %q must project key %q to path `config.json`, because the credential loader opens <DOCKER_CONFIG>/config.json by that exact name. Mounted without `items` the file is called %q, is never found, and the pull silently falls back to anonymous. Add:\n  items:\n    - key: %s\n      path: config.json" $rau.secretName $rau.key $rau.key $rau.key) }}
         {{- end }}
-        {{- $amFound := false }}
+      {{- end }}
+      {{- else }}
+      {{/* --- registryAuth.mode: serviceAccount — the registry-login step ---
+           The server process performs the pull and can only read a file, so
+           the exchange happens one step earlier, in an initContainer, and the
+           result is written into an emptyDir both containers mount. */}}
+        {{- $ras := ($rau.serviceAccount) | default dict }}
+        {{- if $rau.secretName }}
+{{- fail (printf "openbao-platform: seal.plugin.registryAuth.mode is \"serviceAccount\" but registryAuth.secretName is also set to %q. They are alternatives that write the same file: the initContainer would generate config.json into the emptyDir at %s while the Secret volume claims the same mountPath. Clear secretName, or switch mode back to \"secret\"." $rau.secretName $rau.mountPath) }}
+        {{- end }}
+        {{- if not $ras.audience }}
+{{- fail "openbao-platform: seal.plugin.registryAuth.mode is \"serviceAccount\" but registryAuth.serviceAccount.audience is empty. It must equal the audience the Artifactory OIDC provider accepts — the auto-mounted token's default API-server audience is not it, which is the whole reason a token is projected here." }}
+        {{- end }}
+        {{/* Unlike the preloaded path, the exchange is not optional: a raw
+             Kubernetes token is not a registry credential, and a config.json
+             carrying one authenticates as nobody. */}}
+        {{- if not $ras.tokenUrl }}
+{{- fail "openbao-platform: seal.plugin.registryAuth.mode is \"serviceAccount\" but registryAuth.serviceAccount.tokenUrl is empty. A projected Kubernetes token is not a registry credential — it has to be exchanged for an Artifactory access token first. Set it to https://<artifactory>/access/api/v1/oidc/token." }}
+        {{- end }}
+        {{- if not $ras.providerName }}
+{{- fail "openbao-platform: seal.plugin.registryAuth.mode is \"serviceAccount\" but registryAuth.serviceAccount.providerName is empty. The exchange names the OIDC provider whose identity mapping grants read on the Docker repo; without it Artifactory answers 400." }}
+        {{- end }}
+        {{/* An empty username yields `"auth": base64(":<token>")`, which
+             Artifactory treats as anonymous — the exact failure this mode
+             exists to prevent, and it surfaces only as a 401 on the pull. */}}
+        {{- if not $ras.username }}
+{{- fail "openbao-platform: seal.plugin.registryAuth.mode is \"serviceAccount\" but registryAuth.serviceAccount.username is empty. config.json holds a basic-auth pair, so an empty username makes it `:<token>` and Artifactory reads the request as anonymous. Any non-empty value works unless the identity mapping binds a username, in which case use that one." }}
+        {{- end }}
+        {{- if lt (int ($ras.expirationSeconds | default 3600)) 600 }}
+{{- fail (printf "openbao-platform: registryAuth.serviceAccount.expirationSeconds is %v. Kubernetes enforces a 600 second floor and silently raises anything lower, so the value here would not be what the pod gets." $ras.expirationSeconds) }}
+        {{- end }}
+        {{/* server.volumes is not templated by the subchart, so the projected
+             token volume has to be listed literally and matched here. */}}
+        {{- $tokVol := false }}
+        {{- range ($server.volumes | default list) }}
+          {{- range (.projected).sources | default list }}
+            {{- if eq ((.serviceAccountToken).audience | default "") $ras.audience }}{{ $tokVol = true }}{{ end }}
+          {{- end }}
+        {{- end }}
+        {{- if not $tokVol }}
+{{- fail (printf "openbao-platform: no entry in openbao.server.volumes projects a serviceAccountToken with audience %q. The registry-login container reads the token from %s/token, so without that volume it would find nothing to exchange and the plugin pull would fall back to anonymous." $ras.audience $ras.tokenMountPath) }}
+        {{- end }}
+        {{/* The credential directory has to be writable by the initContainer,
+             so it is an emptyDir here rather than the Secret volume mode uses.
+             A Secret or ConfigMap volume would be read-only and the container
+             would fail on the write, after the exchange has already run. */}}
+        {{- $credVolName := "" }}
         {{- range ($server.volumeMounts | default list) }}
-          {{- if eq (.mountPath | default "") $rau.mountPath }}{{ $amFound = true }}{{ end }}
+          {{- if eq (.mountPath | default "") $rau.mountPath }}{{ $credVolName = (.name | default "") }}{{ end }}
         {{- end }}
-        {{- if not $amFound }}
-{{- fail (printf "openbao-platform: no entry in openbao.server.volumeMounts mounts the registry credentials at %q." $rau.mountPath) }}
+        {{- $credVolOk := false }}
+        {{- range ($server.volumes | default list) }}
+          {{- if and (eq (.name | default "") $credVolName) (hasKey . "emptyDir") }}{{ $credVolOk = true }}{{ end }}
         {{- end }}
-        {{- $dockerCfg := (($server.extraEnvironmentVars).DOCKER_CONFIG) | default "" }}
-        {{- if ne $dockerCfg $rau.mountPath }}
-{{- fail (printf "openbao-platform: the registry credentials are mounted at %q but openbao.server.extraEnvironmentVars.DOCKER_CONFIG is %q. DOCKER_CONFIG names the DIRECTORY holding config.json, and it is the only one of the four credential locations that wins deterministically — without it the loader finds nothing and pulls anonymously." $rau.mountPath $dockerCfg) }}
+        {{- if not $credVolOk }}
+{{- fail (printf "openbao-platform: the volume mounted at %s (%q) is not an emptyDir. Under registryAuth.mode \"serviceAccount\" the registry-login container WRITES config.json there, so a Secret or ConfigMap volume fails the write — after the token exchange has already happened." $rau.mountPath $credVolName) }}
+        {{- end }}
+        {{/* The container itself lives in extraInitContainers, which the
+             subchart renders with tpl. Selecting the mode without it leaves an
+             empty credential directory, and an empty directory is anonymous. */}}
+        {{- $rlc := false }}
+        {{- range ($server.extraInitContainers) | default list }}
+          {{- if eq (.name | default "") "registry-login" }}{{ $rlc = true }}{{ end }}
+        {{- end }}
+        {{- if not $rlc }}
+{{- fail "openbao-platform: seal.plugin.registryAuth.mode is \"serviceAccount\" but openbao.server.extraInitContainers has no container named `registry-login`. Nothing would write config.json, the credential directory would be empty, and the pull would silently fall back to anonymous — surfacing as a 401 naming the registry. Copy the container from examples/values-azure-oci.yaml — it is templated from these values, so nothing in it needs editing." }}
+        {{- end }}
+        {{- if not $rca.configMap }}
+{{- fail "openbao-platform: seal.plugin.registryAuth.mode is \"serviceAccount\" but seal.plugin.registryCA.configMap is empty. The registry-login container sets CURL_CA_BUNDLE from registryCA, so curl would be pointed at a path that does not exist and the token exchange would fail before it reaches the network. Name the ConfigMap, or delete the CURL_CA_BUNDLE env entry from the container if Artifactory presents a publicly-trusted certificate." }}
         {{- end }}
       {{- end }}
     {{- end }}

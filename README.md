@@ -58,7 +58,8 @@ kubectl -n openbao get secret openbao-init-keys -o yaml           # Store the ke
 kubectl -n openbao delete secret openbao-init-keys                # Then destroy them
 ```
 
-Overlays in `openbao/examples/` layer on top, `values-openshift.yaml` last, since it turns the Ingress off and the Route on:
+Overlays in `openbao/examples/` layer on top, `values-openshift.yaml` last, since it turns the Ingress off and the Route on.
+`values-azure.yaml` fetches the seal plugin tarball with an initContainer; `values-azure-oci.yaml` has OpenBao pull the image instead, with a `registry-login` initContainer writing the registry credential from the pod's own ServiceAccount.
 
 ```sh
   -f openbao/examples/values-prod.yaml \

@@ -1,0 +1,269 @@
+# Environment: Azure — auto-unseal with Azure Key Vault, seal plugin pulled by
+# OpenBao itself from a private registry, authenticated with the pod's own
+# ServiceAccount.
+#
+#   helm upgrade --install openbao openbao/ -n openbao \
+#     -f openbao/examples/values-prod.yaml \
+#     -f openbao/examples/values-azure-oci.yaml
+#
+# This is the `source: oci` sibling of values-azure.yaml. Use that one unless
+# you cannot run the fetch initContainer — it keeps Artifactory's CA out of
+# OpenBao's trust store entirely. docs/SEAL.md#why-preloaded-is-the-default
+# has the comparison.
+#
+# WHAT THIS OVERLAY SOLVES
+#   The server process performs the OCI pull, and an imagePullSecret does not
+#   reach it — the kubelet is not making the pull. OpenBao has no credential
+#   options either: it reads a Docker config file and, finding none, pulls
+#   ANONYMOUSLY. So the credential has to arrive as a file, and the only way to
+#   produce one from a short-lived identity is to write it before the server
+#   starts. That is the `registry-login` initContainer below: it trades the
+#   pod's projected ServiceAccount token for an Artifactory access token and
+#   writes the `docker login` result — config.json — into an emptyDir the
+#   server mounts as DOCKER_CONFIG. Nothing long-lived is stored anywhere.
+#
+# PREREQUISITES OUTSIDE THIS CHART
+#   1. A Key Vault and a key, with the workload's managed identity granted
+#      Key Vault Crypto User (wrapKey/unwrapKey/get) on it.
+#   2. A federated credential on that identity:
+#        issuer  = the AKS cluster's OIDC issuer URL
+#        subject = system:serviceaccount:<namespace>:<serviceaccount name>
+#        audience= api://AzureADTokenExchange
+#   3. The azure-workload-identity webhook installed in the cluster.
+#   4. An Artifactory OIDC provider whose identity mapping binds
+#        sub = system:serviceaccount:<namespace>:<serviceaccount name>
+#      and grants READ on the DOCKER repo holding the mirrored plugin image.
+#      (values-azure.yaml needs the same thing against the GENERIC repo.)
+
+bootstrap:
+  init:
+    autoUnseal: true
+    keyShares: 5
+    keyThreshold: 3
+
+openbao:
+  server:
+    extraLabels:
+      azure.workload.identity/use: "true"
+
+    serviceAccount:
+      create: true
+      annotations:
+        azure.workload.identity/client-id: "CHANGEME-00000000-0000-0000-0000-000000000000"
+
+    seal:
+      type: azurekeyvault
+      directory: /openbao/plugins
+      downloadBehavior: fail
+      # plugin_auto_download. REQUIRED here: nothing else populates the plugin
+      # directory on this path, and OpenBao's default is false, so without it
+      # the seal fails as "plugin not found" from a config that looks complete.
+      autoDownload: true
+      autoRegister: false
+
+      azurekeyvault:
+        vaultName: CHANGEME-kv
+        keyName: openbao-unseal
+        authMethod: workload_identity
+
+      plugin:
+        enabled: true
+        type: kms
+        name: azurekeyvault
+
+        # ------------------------------------------------------------------
+        # DELIVERY: the OCI image, pulled by the server process.
+        # ------------------------------------------------------------------
+        source: oci
+
+        # WITHOUT A TAG — OpenBao joins image and version itself, and a tag
+        # here becomes a second colon:
+        #   "image and version do not form a valid image reference"
+        # A registry port (host:5000/...) is fine.
+        image: CHANGEME-artifactory.example.com/openbao/openbao-plugin-kms-azure
+        version: v0.1.0
+
+        # What OpenBao looks for inside the image, and installs under.
+        binaryName: openbao-plugin-kms-azure
+
+        # NOT OPTIONAL. Upstream value for kms-azure v0.1.0, linux/amd64.
+        sha256sum: e46a6d13ab427b594c89e58b002db6bbb6d61557f5de8a599557c76827deef0d
+
+        # Artifactory's private CA. On THIS path the pull happens inside
+        # OpenBao, so the bundle must enter its own trust store via
+        # SSL_CERT_DIR below — mounting it is not enough. The same ConfigMap is
+        # mounted into registry-login as CURL_CA_BUNDLE for the exchange.
+        registryCA:
+          configMap: CHANGEME-artifactory-ca-bundle
+          key: ca-bundle.crt
+          mountPath: /openbao/tls/registry
+
+        registryAuth:
+          # The pod's own ServiceAccount, exchanged for an Artifactory access
+          # token and written out as config.json. The alternative, `secret`,
+          # mounts a dockerconfigjson Secret you created by hand — a
+          # long-lived password sitting in the namespace.
+          mode: serviceAccount
+          # DOCKER_CONFIG names this DIRECTORY, and config.json is written
+          # into it. Pointing DOCKER_CONFIG at the file finds nothing.
+          mountPath: /openbao/.docker
+
+          serviceAccount:
+            # MUST equal the audience configured on the Artifactory OIDC
+            # provider. The auto-mounted token's default API-server audience
+            # will not be accepted, which is why a token is projected here
+            # with an audience of its own.
+            audience: CHANGEME-artifactory
+            expirationSeconds: 3600
+            tokenMountPath: /var/run/secrets/artifactory
+            tokenUrl: CHANGEME-https://artifactory.example.com/access/api/v1/oidc/token
+            providerName: CHANGEME-k8s-openbao
+            # The docker username. Artifactory takes the identity from the
+            # token, so this only has to be non-empty — unless the identity
+            # mapping binds a username, in which case use that one. Empty
+            # would make the basic-auth pair `:<token>`, which reads as
+            # anonymous, so the render refuses it.
+            username: CHANGEME-openbao
+            # Registry key inside config.json. Empty -> the host part of
+            # `image` above, which is what the pull looks up.
+            registry: ""
+
+    volumes:
+      - name: tls-internal
+        secret: { secretName: openbao-tls-internal, defaultMode: 0400 }
+      - name: tls-server
+        secret: { secretName: openbao-tls-server, defaultMode: 0400 }
+      # OpenBao extracts the plugin here. A real, writable, non-symlink
+      # directory; re-downloaded and re-verified on every start.
+      - name: plugins
+        emptyDir: {}
+      - name: registry-ca
+        configMap:
+          name: CHANGEME-artifactory-ca-bundle
+      # The pod's ServiceAccount token, minted for Artifactory's audience.
+      # Mounted into registry-login ONLY — the server never sees it.
+      - name: artifactory-token
+        projected:
+          sources:
+            - serviceAccountToken:
+                path: token
+                audience: CHANGEME-artifactory
+                expirationSeconds: 3600
+      # Where registry-login writes config.json and the server reads it. An
+      # emptyDir because it has to be WRITABLE: a Secret volume would fail the
+      # write, and the render checks for that.
+      - name: registry-auth
+        emptyDir: {}
+      # Writable scratch for registry-login, which runs with
+      # readOnlyRootFilesystem. The intermediate credential files live here.
+      - name: tmp
+        emptyDir: {}
+    volumeMounts:
+      - { name: tls-internal, mountPath: /openbao/tls/internal, readOnly: true }
+      - { name: tls-server,   mountPath: /openbao/tls/server,   readOnly: true }
+      - { name: plugins,      mountPath: /openbao/plugins }
+      - { name: registry-ca,  mountPath: /openbao/tls/registry, readOnly: true }
+      - { name: registry-auth, mountPath: /openbao/.docker, readOnly: true }
+
+    extraEnvironmentVars:
+      # SSL_CERT_DIR REPLACES Go's default certificate directories rather than
+      # extending them, so every directory needed has to be listed. Dropping
+      # /openbao/tls/internal here breaks the http audit device, which takes no
+      # CA option either — and a failing audit device stops OpenBao serving
+      # requests. Public roots are unaffected: they come from a default bundle
+      # FILE that SSL_CERT_DIR does not touch.
+      SSL_CERT_DIR: /openbao/tls/internal:/openbao/tls/registry
+      # The DIRECTORY holding config.json. Of the four places the credential
+      # loader looks, this is the only one that wins deterministically.
+      DOCKER_CONFIG: /openbao/.docker
+
+    # ----------------------------------------------------------------------
+    # The docker login step.
+    #
+    # The subchart renders extraInitContainers with `tpl`, so the script reads
+    # .Values.server.seal.* directly and cannot drift from the values above —
+    # every CHANGEME lives in those values, not in here.
+    #
+    # This is a values FILE, so it must parse as YAML BEFORE tpl runs.
+    # Templating therefore appears only inside scalars; the env entries and
+    # volumeMounts are structural, so they are literal and the render checks
+    # them against registryAuth instead.
+    # ----------------------------------------------------------------------
+    extraInitContainers:
+      - name: registry-login
+        image: '{{ .Values.server.seal.plugin.registryAuth.serviceAccount.image }}'
+        imagePullPolicy: '{{ .Values.server.seal.plugin.registryAuth.serviceAccount.imagePullPolicy }}'
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: { drop: ["ALL"] }
+        resources:
+          requests: { cpu: 50m, memory: 64Mi }
+          limits:   { cpu: 500m, memory: 128Mi }
+        env:
+          # curl's own trust store, for the exchange only. OpenBao gets the
+          # same CA separately through SSL_CERT_DIR, for the pull.
+          - name: CURL_CA_BUNDLE
+            value: '{{ .Values.server.seal.plugin.registryCA.mountPath }}/{{ .Values.server.seal.plugin.registryCA.key }}'
+          # curlimages/curl runs with a read-only root; give it a writable HOME.
+          - name: HOME
+            value: /tmp
+        command: ["/bin/sh", "-eu", "-c"]
+        args:
+          - |
+            {{- $p := .Values.server.seal.plugin }}
+            {{- $ra := $p.registryAuth }}
+            {{- $sa := $ra.serviceAccount }}
+            # The config.json key must be what the pull looks up: the registry
+            # host from `image`, port included if it has one.
+            REGISTRY="{{ $sa.registry | default (first (splitList "/" $p.image)) }}"
+            DIR="{{ $ra.mountPath }}"
+
+            cd /tmp
+            umask 077
+
+            SA_TOKEN="$(cat {{ $sa.tokenMountPath }}/token)"
+
+            # RFC 8693 token exchange: trade the projected Kubernetes token for
+            # an Artifactory access token. Both tokens travel through files,
+            # never argv, so neither is visible in `ps`.
+            cat > exchange.json <<EOF
+            {"grant_type":"urn:ietf:params:oauth:grant-type:token-exchange",
+             "subject_token_type":"urn:ietf:params:oauth:token-type:id_token",
+             "subject_token":"${SA_TOKEN}",
+             "provider_name":"{{ $sa.providerName }}"}
+            EOF
+            curl -fsS -X POST -H 'Content-Type: application/json' \
+                 -d @exchange.json -o exchange-out.json \
+                 '{{ $sa.tokenUrl }}'
+            rm -f exchange.json
+            TOKEN="$(sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' exchange-out.json)"
+            rm -f exchange-out.json
+            # An identity mapping that matches nothing still answers 200, so an
+            # empty access_token is the failure to catch here, not the HTTP
+            # code. Left unchecked it would produce a well-formed config.json
+            # that authenticates as nobody, and the pull would 401 instead.
+            [ -n "$TOKEN" ] || { echo "OIDC token exchange returned no access_token" >&2; exit 1; }
+
+            # `docker login`, without docker: the auth field is base64 of
+            # "user:password", with NO trailing newline — the decoder splits on
+            # the first colon and a newline would land in the password. The
+            # pair goes through a file rather than `printf` arguments, and
+            # busybox base64 wraps at 76 columns, hence the tr.
+            cat > pair <<EOF
+            {{ $sa.username }}:${TOKEN}
+            EOF
+            AUTH="$(tr -d '\n' < pair | base64 | tr -d '\n')"
+            rm -f pair
+
+            cat > "${DIR}/config.json" <<EOF
+            {"auths":{"${REGISTRY}":{"auth":"${AUTH}"}}}
+            EOF
+            chmod 0600 "${DIR}/config.json"
+            echo "wrote ${DIR}/config.json for ${REGISTRY}"
+        volumeMounts:
+          # Written here, read by the server as DOCKER_CONFIG. NOT readOnly.
+          - { name: registry-auth, mountPath: /openbao/.docker }
+          - { name: tmp,          mountPath: /tmp }
+          - { name: registry-ca,  mountPath: /openbao/tls/registry, readOnly: true }
+          - { name: artifactory-token, mountPath: /var/run/secrets/artifactory, readOnly: true }
