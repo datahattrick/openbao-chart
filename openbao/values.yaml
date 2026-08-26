@@ -996,23 +996,87 @@ openbao:
         # than failing, so a private repo answers 401/403 and the error names
         # the registry, not the missing Secret.
         #
-        # Declaring secretName mounts nothing by itself; the render fails
-        # unless openbao.server.volumes, .volumeMounts and
-        # .extraEnvironmentVars.DOCKER_CONFIG agree. See values-azure.yaml.
+        # Nothing here mounts anything by itself — Helm cannot template
+        # subchart values — so the render fails unless openbao.server.volumes,
+        # .volumeMounts and .extraEnvironmentVars.DOCKER_CONFIG agree with it.
+        # See examples/values-azure-oci.yaml.
         registryAuth:
-          # Secret holding the credentials. Normally a
-          # kubernetes.io/dockerconfigjson from
+          #   secret          a dockerconfigjson Secret you created yourself,
+          #                   mounted read-only. Nothing to exchange, but the
+          #                   password is long-lived and lives in the namespace.
+          #   serviceAccount  the `registry-login` initContainer trades the
+          #                   pod's projected ServiceAccount token for an
+          #                   Artifactory access token and writes config.json
+          #                   into an emptyDir the server then reads. This is
+          #                   the same exchange the preloaded path's fetch step
+          #                   performs — see fetch.auth.serviceAccount — done
+          #                   one step earlier, because the puller here is
+          #                   OpenBao and it only knows how to read a file.
+          #                   Nothing long-lived is stored.
+          mode: secret
+
+          # mode: secret. Normally a kubernetes.io/dockerconfigjson from
           #   kubectl create secret docker-registry <name> \
           #     --docker-server=... --docker-username=... --docker-password=...
           # An existing imagePullSecret can be reused as-is.
           secretName: ""
           # Key inside it. `.dockerconfigjson` is what that Secret type uses.
           key: .dockerconfigjson
-          # Directory DOCKER_CONFIG points at. The volume MUST rename the key
-          # to `config.json` with `items` — the loader looks for exactly that
-          # filename, and a Secret mounted without items produces a file named
-          # after the key, which is silently not found.
+
+          # Directory DOCKER_CONFIG points at, in BOTH modes. Under
+          # mode: secret the volume MUST rename the key to `config.json` with
+          # `items` — the loader looks for exactly that filename, and a Secret
+          # mounted without items produces a file named after the key, which is
+          # silently not found. Under mode: serviceAccount it is an emptyDir
+          # and the initContainer writes `config.json` into it directly.
           mountPath: /openbao/.docker
+
+          # -----------------------------------------------------------------
+          # mode: serviceAccount — the `registry-login` initContainer
+          # -----------------------------------------------------------------
+          # Drives a container in openbao.server.extraInitContainers, which the
+          # subchart renders with `tpl`, so it reads these values directly and
+          # cannot drift from them. A worked copy is in
+          # examples/values-azure-oci.yaml; the render fails if this mode is
+          # selected and the container is missing.
+          serviceAccount:
+            image: docker.io/curlimages/curl:8.11.1
+            imagePullPolicy: IfNotPresent
+
+            # Audience the token is minted for. MUST match the audience the
+            # Artifactory OIDC provider is configured to accept — the default
+            # API-server audience will not do, which is why this projects its
+            # own token rather than reusing the auto-mounted one.
+            audience: ""
+            # Kubernetes enforces a 600s floor. The token is used once, at pod
+            # start, so there is no reason to go long.
+            expirationSeconds: 3600
+            # Where the projected token is mounted in the initContainer.
+            tokenMountPath: /var/run/secrets/artifactory
+
+            # JFrog OIDC token exchange (RFC 8693). The projected token is
+            # POSTed here and the `access_token` from the reply becomes the
+            # docker password.
+            #   https://<artifactory>/access/api/v1/oidc/token
+            # Unlike the preloaded path this is REQUIRED: a raw Kubernetes
+            # token is not a registry credential.
+            tokenUrl: ""
+            # The OIDC provider's name in Artifactory. The identity mapping on
+            # it is what grants read on the Docker repo.
+            providerName: ""
+
+            # Docker username written into config.json beside the exchanged
+            # token. Artifactory reads the identity from the token itself, so
+            # this only has to be non-empty — but if your identity mapping
+            # binds a username, use that one. Required: an empty username
+            # produces a config.json that authenticates as nobody, and an
+            # anonymous pull is exactly the failure this mode exists to avoid.
+            username: ""
+
+            # Registry host key inside config.json. Empty -> the host part of
+            # seal.plugin.image, which is what the pull will look up.
+            # Set it only if the registry redirects to a different host.
+            registry: ""
 
         args: []
         env: []

@@ -4,7 +4,7 @@ Two environments, two mechanisms — and only one of them needs a plugin.
 
 | Environment | Seal | Plugin needed? | Overlay |
 |---|---|---|---|
-| Azure | `azurekeyvault` | **yes**, from v2.7.0 | `values-azure.yaml` |
+| Azure | `azurekeyvault` | **yes**, from v2.7.0 | `values-azure.yaml`, or `values-azure-oci.yaml` |
 | Other | `transit` (another OpenBao) | no — stays built-in | `values-transit.yaml` |
 
 ## What changes in v2.7.0
@@ -49,7 +49,7 @@ flowchart TB
 
     subgraph oci["source: oci"]
         direction TB
-        o1["OpenBao pulls the OCI image itself"] --> o2["extracts binary"] --> o3["verifies sha256sum"]
+        o0["config.json<br/><i>a Secret, or minted by registry-login</i>"] --> o1["OpenBao pulls the OCI image itself"] --> o2["extracts binary"] --> o3["verifies sha256sum"]
     end
 
     art -->|"generic repo"| pre
@@ -75,7 +75,7 @@ gives you almost no control over it:
 | | `preloaded` | `oci` |
 |---|---|---|
 | Who talks to Artifactory | curl, in an initContainer | the OpenBao server process |
-| Credentials | any of three methods, incl. the pod's ServiceAccount | a `dockerconfigjson` file found by a fixed search order |
+| Credentials | any of three methods, incl. the pod's ServiceAccount | a `dockerconfigjson` file found by a fixed search order — an initContainer can [mint one](#mode-serviceaccount--docker-login-from-the-pods-own-identity) from the pod's ServiceAccount |
 | Missing credentials | curl fails loudly | pulls **anonymously**, 401 looks like a wrong password |
 | Private CA | `CURL_CA_BUNDLE`, scoped to curl | must enter OpenBao's own trust store via `SSL_CERT_DIR` |
 | Failure surface | one container, one log line | server startup, mixed in with the seal |
@@ -86,7 +86,12 @@ audit device depends on, and one that *replaces* Go's defaults rather than
 extending them. On `preloaded` OpenBao never talks to Artifactory at all, so its
 trust store is left alone.
 
-Reach for `oci` only if you cannot run an initContainer.
+Reach for `oci` only if you cannot run an initContainer, or if the registry is
+the only copy of the plugin you have. The credential row closes —
+`registryAuth.mode: serviceAccount` mints the file from the pod's own
+ServiceAccount, with nothing long-lived stored, and it still needs an
+initContainer to do it. The CA row does not: on `oci` the pull happens inside
+OpenBao no matter who wrote the credential.
 
 ### The two binary names
 
@@ -269,6 +274,7 @@ openbao:
     seal:
       plugin:
         registryAuth:
+          mode: secret
           secretName: artifactory-pull
           key: .dockerconfigjson
           mountPath: /openbao/.docker
@@ -288,6 +294,21 @@ openbao:
       DOCKER_CONFIG: /openbao/.docker   # the DIRECTORY, not the file
 ```
 
+`DOCKER_CONFIG` names the **directory**; pointing it at the file finds nothing.
+The chart checks that too, along with the volume and the volumeMount.
+
+Where that `config.json` comes from is `registryAuth.mode`:
+
+| | `secret` | `serviceAccount` |
+|---|---|---|
+| Who writes the file | you, once | the `registry-login` initContainer, every pod start |
+| Credential | long-lived, until you rotate it | an Artifactory access token minted per pod |
+| At rest in the namespace | yes, in a Secret | nothing |
+| The volume | the Secret, `items` renaming the key | an `emptyDir` |
+| Also needs | — | an Artifactory OIDC provider and identity mapping |
+
+#### `mode: secret`
+
 The Secret is an ordinary `kubernetes.io/dockerconfigjson`, so an existing
 imagePullSecret can be reused as-is:
 
@@ -303,8 +324,95 @@ kubectl create secret docker-registry artifactory-pull -n openbao \
 > anonymous. The rename is what makes the mount work, and the chart fails the
 > render without it.
 
-`DOCKER_CONFIG` names the **directory**; pointing it at the file finds nothing.
-The chart checks that too, along with the volume and the volumeMount.
+#### `mode: serviceAccount` — docker login from the pod's own identity
+
+OpenBao cannot fetch a credential; it can only read one. So the exchange the
+`preloaded` path performs *during* the download happens one step earlier here,
+in an initContainer, and its result is left on disk for the server to find.
+Worked overlay: [examples/values-azure-oci.yaml](../openbao/examples/values-azure-oci.yaml).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as kubelet
+    participant I as registry-login (initContainer)
+    participant A as Artifactory
+    participant D as emptyDir at DOCKER_CONFIG
+    participant B as openbao (server)
+
+    K->>I: project SA token<br/>aud: <registryAuth.serviceAccount.audience><br/>exp: 3600s
+    I->>A: POST /access/api/v1/oidc/token<br/>grant_type=token-exchange<br/>subject_token=<SA JWT>
+    A->>A: match identity mapping<br/>sub = system:serviceaccount:ns:sa<br/>read on the DOCKER repo
+    A-->>I: access_token
+    I->>D: write config.json<br/>auths[registry].auth = base64 of "username:access_token"
+    Note over I: exits; both tokens' temp files are removed
+    B->>A: pull plugin image<br/>credential read from DOCKER_CONFIG
+    A-->>B: image → binary → sha256sum verified
+```
+
+```yaml
+openbao:
+  server:
+    seal:
+      plugin:
+        registryAuth:
+          mode: serviceAccount
+          mountPath: /openbao/.docker
+          serviceAccount:
+            audience: artifactory
+            expirationSeconds: 3600
+            tokenMountPath: /var/run/secrets/artifactory
+            tokenUrl: https://artifactory.example.com/access/api/v1/oidc/token
+            providerName: k8s-openbao
+            username: openbao          # must be non-empty — see below
+            registry: ""               # defaults to the host part of `image`
+
+    volumes:
+      - name: registry-auth            # WRITTEN to, so an emptyDir
+        emptyDir: {}
+      - name: artifactory-token
+        projected:
+          sources:
+            - serviceAccountToken: { path: token, audience: artifactory, expirationSeconds: 3600 }
+    volumeMounts:
+      - { name: registry-auth, mountPath: /openbao/.docker, readOnly: true }
+
+    extraEnvironmentVars:
+      DOCKER_CONFIG: /openbao/.docker
+```
+
+The identity mapping is the same shape as the `preloaded` path's, but it must
+grant read on the **Docker** repo rather than the generic one. Everything said
+about the audience there applies unchanged: it is not the auto-mounted token's
+audience, which is why a token is projected with one of its own, and
+`expirationSeconds` has the same silent 600 second floor.
+
+Four things about the file itself are easy to get wrong, and all four fail as an
+identical 401 from the registry, so the chart or the script catches each:
+
+- **The `auth` field is base64 of `user:password` with no trailing newline.**
+  The decoder splits on the first colon, so a newline lands inside the password.
+  The pair is assembled through a file and `tr -d '\n'`, not `printf`
+  arguments — which also keeps the token out of `ps`, exactly as in the fetch
+  script.
+- **The username must be non-empty.** Artifactory takes the identity from the
+  token, so its value rarely matters, but an empty one makes the pair `:<token>`
+  and the request reads as anonymous. The render refuses it.
+- **The registry key must be what the pull looks up** — the host part of
+  `seal.plugin.image`, port included if it has one. That is the default;
+  `registry` overrides it only if the registry redirects elsewhere.
+- **The credential volume is an `emptyDir`.** A Secret or ConfigMap volume is
+  read-only, so the write fails *after* the exchange has already happened. The
+  render checks the volume's type.
+
+The registry's CA is needed **twice** on this path, by two different consumers:
+`CURL_CA_BUNDLE` on the initContainer for the token exchange, and `SSL_CERT_DIR`
+on the server for the pull itself. One ConfigMap, mounted into both.
+
+> **The token is not refreshed.** It is minted at pod start and spent seconds
+> later, when the server downloads the plugin — which is the only time OpenBao
+> pulls. A `bao plugin reload` days afterwards would find an expired credential
+> in `config.json` and fail; restart the pod to mint a new one.
 
 #### Credentials cannot go in the reference
 
@@ -433,7 +541,7 @@ decrypt it.
 Rendered and validated, **not deployed** — the homelab cluster has neither Azure
 nor a second OpenBao. What was checked directly:
 
-- both overlays render; the `seal`, `plugin`, `plugin_directory` stanzas emit
+- all three overlays render; the `seal`, `plugin`, `plugin_directory` stanzas emit
   correctly, and `plugin_directory` is omitted when no plugin is registered
 - the split `image`/`version` reference, `plugin_auto_download` and
   `plugin_auto_register` were corrected against the upstream declarative-plugin
@@ -453,7 +561,16 @@ nor a second OpenBao. What was checked directly:
   hashed — identical bytes, and the published checksum matches
 - the fetch script's download → `sha256sum -c` → `install` logic was executed
   against the real artifact; a tampered binary is correctly refused
-- 38 negative tests against the validation rules, all caught
+- **the `registry-login` script was rendered and then executed** in
+  `curlimages/curl:8.11.1` against a stub standing in for Artifactory: the
+  exchange POSTs the projected token, the *exchanged* token is what reaches
+  `config.json`, the base64 pair carries no trailing newline and stays unwrapped
+  for a 515-character token, the file lands 0600 under the registry host taken
+  from `image`, and no credential temp file survives. An exchange answering 200
+  with no `access_token`, and a failing exchange, both abort before anything is
+  written. Not tested against a real Artifactory Docker repo, and the resulting
+  `config.json` was not put in front of go-containerregistry's keychain
+- 54 negative tests against the validation rules, all caught
 
 Not verified without Azure: the federated token exchange and an actual
 wrap/unwrap against Key Vault.

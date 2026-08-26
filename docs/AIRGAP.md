@@ -24,7 +24,7 @@ Four, all overridable:
 | `ghcr.io/openbao/openbao-snapshot-agent:0.4.1` | snapshot CronJob **and** restore Job | `openbao.snapshotAgent.image`, `restore.image` |
 | `docker.io/otel/opentelemetry-collector-contrib:0.159.0` | audit proxy | `auditProxy.image` |
 | `ghcr.io/openbao/openbao-plugin-kms-azure:v0.1.0` | Azure Key Vault seal (only when `seal.plugin.source: oci`) | `openbao.server.seal.plugin.image` |
-| `docker.io/curlimages/curl:8.11.1` | seal plugin fetch initContainer (only when `seal.plugin.source: preloaded`) | in `values-azure.yaml` |
+| `docker.io/curlimages/curl:8.11.1` | seal plugin fetch initContainer (`source: preloaded`), and the `registry-login` initContainer (`source: oci` with `registryAuth.mode: serviceAccount`) | in `values-azure.yaml`; `…registryAuth.serviceAccount.image` |
 
 The UBI image is the default on both platforms. Swap
 `openbao.server.image.repository` for `openbao/openbao` to mirror the smaller
