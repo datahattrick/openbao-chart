@@ -359,6 +359,16 @@ naming the value to fix.
       {{- if not $seal.plugin.image }}
 {{- fail "openbao-platform: seal.plugin.source is \"oci\" but seal.plugin.image is empty." }}
       {{- end }}
+      {{/* `image` is an OCI reference, not a URL: no scheme, and no userinfo.
+           go-containerregistry validates the registry as an RFC 3986
+           AUTHORITY (url.Parse("//"+name), then url.Host must equal name),
+           which both forms fail. Credentials go in registryAuth. */}}
+      {{- if contains "://" $seal.plugin.image }}
+{{- fail (printf "openbao-platform: seal.plugin.image is %q, but it is an OCI reference and takes no scheme — no oci://, docker:// or https://. Give the registry and repository alone, e.g. artifactory.example.com/openbao/openbao-plugin-kms-azure." $seal.plugin.image) }}
+      {{- end }}
+      {{- if contains "@" (first (splitList "/" $seal.plugin.image)) }}
+{{- fail (printf "openbao-platform: seal.plugin.image is %q. Credentials cannot be embedded in the reference: an OCI registry must be a bare RFC 3986 authority, so user:password@host is rejected before any pull is attempted. It would also be plaintext in a ConfigMap, since the server config is not a Secret. Use seal.plugin.registryAuth, which mounts a kubernetes.io/dockerconfigjson Secret." $seal.plugin.image) }}
+      {{- end }}
       {{/* The tag belongs in `version`. Only the LAST path segment can hold
            one — a colon earlier is a registry port, which is legitimate. */}}
       {{- $ref := last (splitList "/" $seal.plugin.image) }}

@@ -230,6 +230,21 @@ kubectl create secret docker-registry artifactory-pull -n openbao \
 `DOCKER_CONFIG` names the **directory**; pointing it at the file finds nothing.
 The chart checks that too, along with the volume and the volumeMount.
 
+#### Credentials cannot go in the reference
+
+There is no `oci://user:password@registry/repo` form, and no auth field in the
+plugin stanza. `image` is an OCI reference, not a URL: go-containerregistry
+validates the registry as an RFC 3986 **authority** —
+`url.Parse("//" + name)`, then `url.Host` must equal `name` — which both a
+scheme and a `user:pass@` prefix fail, before any pull is attempted.
+
+It would be the wrong place regardless. The server config is rendered into a
+**ConfigMap**, not a Secret, so a password there would be readable by anyone who
+can read ConfigMaps in the namespace — the same reason the transit seal's token
+comes from `extraSecretEnvironmentVars` and never from the config file.
+
+The chart fails the render on both forms and names `registryAuth` instead.
+
 The published `checksums-kms-azure.txt` line refers to the **tarball** name.
 Verified by extracting both and comparing hashes — identical
 (`e46a6d13…`). The chart models this as two values: `binaryName` (OCI /
@@ -355,7 +370,7 @@ nor a second OpenBao. What was checked directly:
   hashed — identical bytes, and the published checksum matches
 - the fetch script's download → `sha256sum -c` → `install` logic was executed
   against the real artifact; a tampered binary is correctly refused
-- 24 negative tests against the validation rules, all caught
+- 26 negative tests against the validation rules, all caught
 
 Not verified without Azure: the federated token exchange and an actual
 wrap/unwrap against Key Vault.
