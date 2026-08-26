@@ -163,6 +163,16 @@ naming the value to fix.
   {{- if and (($ad.http).tls) (not (include "obp.tlsEnabled" .)) }}
 {{- fail "openbao-platform: openbao.server.auditDevices.http.tls is true but global.tlsDisable is set, so there is no backend CA to issue the proxy a certificate or for OpenBao to verify it against. Turn the hop's TLS off too, or leave global.tlsDisable=false." }}
   {{- end }}
+  {{/* The device has no CA option: it trusts whatever is in the process store,
+       which for the backend CA means SSL_CERT_DIR. That variable REPLACES Go's
+       default directory list, so appending a second entry and losing this one
+       is a one-character mistake that breaks every audit write. */}}
+  {{- if ($ad.http).tls }}
+    {{- $certDir := (($server.extraEnvironmentVars).SSL_CERT_DIR) | default "" }}
+    {{- if not (has .Values.tls.internal.mountPath (splitList ":" $certDir)) }}
+{{- fail (printf "openbao-platform: the http audit device speaks TLS to the audit proxy, but openbao.server.extraEnvironmentVars.SSL_CERT_DIR is %q and does not list the backend CA's mount %q. The device takes no CA option, so OpenBao could not verify the proxy and every audit write would fail — which stops OpenBao serving requests. SSL_CERT_DIR is a colon-separated list and REPLACES Go's defaults, so keep this entry in it when you add others." $certDir .Values.tls.internal.mountPath) }}
+    {{- end }}
+  {{- end }}
   {{- if ne (int ($ad.http).port) (int .Values.auditProxy.listen.port) }}
 {{- fail (printf "openbao-platform: openbao.server.auditDevices.http.port is %v but auditProxy.listen.port is %v. Audit records would be posted to a closed port and OpenBao would fail to start." ($ad.http).port .Values.auditProxy.listen.port) }}
   {{- end }}
@@ -345,9 +355,22 @@ naming the value to fix.
     {{- if not (has ($seal.plugin.source | default "preloaded") (list "oci" "preloaded")) }}
 {{- fail (printf "openbao-platform: seal.plugin.source is %q; supported values are \"oci\" and \"preloaded\"." $seal.plugin.source) }}
     {{- end }}
+    {{- if and (($seal.plugin.fetch).enabled) (ne ($seal.plugin.source | default "preloaded") "preloaded") }}
+{{- fail (printf "openbao-platform: seal.plugin.fetch.enabled is true but seal.plugin.source is %q. The fetch initContainer installs the binary into the plugin directory, which is what source=preloaded means; under source=oci OpenBao downloads it itself and the two would race the same path." $seal.plugin.source) }}
+    {{- end }}
     {{- if eq ($seal.plugin.source | default "preloaded") "oci" }}
       {{- if not $seal.plugin.image }}
 {{- fail "openbao-platform: seal.plugin.source is \"oci\" but seal.plugin.image is empty." }}
+      {{- end }}
+      {{/* `image` is an OCI reference, not a URL: no scheme, and no userinfo.
+           go-containerregistry validates the registry as an RFC 3986
+           AUTHORITY (url.Parse("//"+name), then url.Host must equal name),
+           which both forms fail. Credentials go in registryAuth. */}}
+      {{- if contains "://" $seal.plugin.image }}
+{{- fail (printf "openbao-platform: seal.plugin.image is %q, but it is an OCI reference and takes no scheme — no oci://, docker:// or https://. Give the registry and repository alone, e.g. artifactory.example.com/openbao/openbao-plugin-kms-azure." $seal.plugin.image) }}
+      {{- end }}
+      {{- if contains "@" (first (splitList "/" $seal.plugin.image)) }}
+{{- fail (printf "openbao-platform: seal.plugin.image is %q. Credentials cannot be embedded in the reference: an OCI registry must be a bare RFC 3986 authority, so user:password@host is rejected before any pull is attempted. It would also be plaintext in a ConfigMap, since the server config is not a Secret. Use seal.plugin.registryAuth, which mounts a kubernetes.io/dockerconfigjson Secret." $seal.plugin.image) }}
       {{- end }}
       {{/* The tag belongs in `version`. Only the LAST path segment can hold
            one — a colon earlier is a registry port, which is legitimate. */}}
@@ -358,6 +381,125 @@ naming the value to fix.
       {{- if not $seal.autoDownload }}
 {{- fail "openbao-platform: seal.plugin.source is \"oci\" but seal.autoDownload is false. `plugin_auto_download` defaults to FALSE in OpenBao, so the server would never contact the registry, nothing would land in the plugin directory, and the seal would fail as \"plugin not found\". Set seal.autoDownload=true, or use source=preloaded and fetch the binary with an initContainer." }}
       {{- end }}
+      {{/* Private registry CA. The pull happens in the server process and has
+           no CA option of its own, so the bundle has to be mounted AND named
+           in SSL_CERT_DIR. Declaring the ConfigMap mounts nothing by itself —
+           Helm cannot template subchart values — so all three are checked. */}}
+      {{- $rca := ($seal.plugin.registryCA) | default dict }}
+      {{- if $rca.configMap }}
+        {{- $cmFound := false }}
+        {{- range ($server.volumes | default list) }}
+          {{- if eq ((.configMap).name | default "") $rca.configMap }}{{ $cmFound = true }}{{ end }}
+        {{- end }}
+        {{- if not $cmFound }}
+{{- fail (printf "openbao-platform: seal.plugin.registryCA.configMap is %q but no entry in openbao.server.volumes mounts that ConfigMap. The image pull would fall back to public roots and fail with `x509: certificate signed by unknown authority`. Add the volume (and its volumeMount at %s)." $rca.configMap $rca.mountPath) }}
+        {{- end }}
+        {{- $mFound := false }}
+        {{- range ($server.volumeMounts | default list) }}
+          {{- if eq (.mountPath | default "") $rca.mountPath }}{{ $mFound = true }}{{ end }}
+        {{- end }}
+        {{- if not $mFound }}
+{{- fail (printf "openbao-platform: no entry in openbao.server.volumeMounts mounts the registry CA at %q. The ConfigMap is declared and attached to the pod but never appears in the filesystem." $rca.mountPath) }}
+        {{- end }}
+        {{- $certDir := (($server.extraEnvironmentVars).SSL_CERT_DIR) | default "" }}
+        {{- if not (has $rca.mountPath (splitList ":" $certDir)) }}
+{{- fail (printf "openbao-platform: the registry CA is mounted at %q but openbao.server.extraEnvironmentVars.SSL_CERT_DIR is %q, which does not list it. Go reads only the directories named there, so the bundle would sit on disk untrusted. Make it a colon-separated list that includes BOTH the backend CA's mount and %s." $rca.mountPath $certDir $rca.mountPath) }}
+        {{- end }}
+      {{- end }}
+      {{/* Registry credentials. The credential loader checks
+           $HOME/.docker/config.json, then DOCKER_CONFIG, then
+           REGISTRY_AUTH_FILE, then the podman paths, and falls back to an
+           ANONYMOUS pull rather than an error — so every way of getting this
+           wrong surfaces as a 401 from the registry. */}}
+      {{- $rau := ($seal.plugin.registryAuth) | default dict }}
+      {{- if $rau.secretName }}
+        {{- $authVol := dict }}
+        {{- range ($server.volumes | default list) }}
+          {{- if eq ((.secret).secretName | default "") $rau.secretName }}{{ $authVol = . }}{{ end }}
+        {{- end }}
+        {{- if not $authVol }}
+{{- fail (printf "openbao-platform: seal.plugin.registryAuth.secretName is %q but no entry in openbao.server.volumes mounts that Secret. An imagePullSecret does not help here — the kubelet is not making this pull — so the plugin image would be fetched anonymously and the registry would answer 401." $rau.secretName) }}
+        {{- end }}
+        {{/* The loader opens <DOCKER_CONFIG>/config.json by that exact name.
+             A Secret mounted without `items` produces a file named after the
+             key, which is simply not found — and not found means anonymous. */}}
+        {{- $renamed := false }}
+        {{- range ($authVol.secret).items | default list }}
+          {{- if and (eq (.key | default "") $rau.key) (eq (.path | default "") "config.json") }}{{ $renamed = true }}{{ end }}
+        {{- end }}
+        {{- if not $renamed }}
+{{- fail (printf "openbao-platform: the volume for Secret %q must project key %q to path `config.json`, because the credential loader opens <DOCKER_CONFIG>/config.json by that exact name. Mounted without `items` the file is called %q, is never found, and the pull silently falls back to anonymous. Add:\n  items:\n    - key: %s\n      path: config.json" $rau.secretName $rau.key $rau.key $rau.key) }}
+        {{- end }}
+        {{- $amFound := false }}
+        {{- range ($server.volumeMounts | default list) }}
+          {{- if eq (.mountPath | default "") $rau.mountPath }}{{ $amFound = true }}{{ end }}
+        {{- end }}
+        {{- if not $amFound }}
+{{- fail (printf "openbao-platform: no entry in openbao.server.volumeMounts mounts the registry credentials at %q." $rau.mountPath) }}
+        {{- end }}
+        {{- $dockerCfg := (($server.extraEnvironmentVars).DOCKER_CONFIG) | default "" }}
+        {{- if ne $dockerCfg $rau.mountPath }}
+{{- fail (printf "openbao-platform: the registry credentials are mounted at %q but openbao.server.extraEnvironmentVars.DOCKER_CONFIG is %q. DOCKER_CONFIG names the DIRECTORY holding config.json, and it is the only one of the four credential locations that wins deterministically — without it the loader finds nothing and pulls anonymously." $rau.mountPath $dockerCfg) }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{/* --- source: preloaded — the fetch initContainer -------------------- */}}
+    {{- $f := ($seal.plugin.fetch) | default dict }}
+    {{- if $f.enabled }}
+      {{- if not $f.url }}
+{{- fail "openbao-platform: seal.plugin.fetch.enabled is true but fetch.url is empty. It is the FULL URL of the release tarball in Artifactory's generic repo." }}
+      {{- end }}
+      {{/* The container itself lives in extraInitContainers, which the
+           subchart renders with tpl. Enabling fetch without it silently
+           produces a pod that starts OpenBao against an empty plugin dir. */}}
+      {{- $fc := false }}
+      {{- range ($server.extraInitContainers) | default list }}
+        {{- if eq (.name | default "") "fetch-seal-plugin" }}{{ $fc = true }}{{ end }}
+      {{- end }}
+      {{- if not $fc }}
+{{- fail "openbao-platform: seal.plugin.fetch.enabled is true but openbao.server.extraInitContainers has no container named `fetch-seal-plugin`. Nothing would put the binary in the plugin directory and OpenBao would fail to start with the seal unresolvable. Copy the container from examples/values-azure.yaml — it is templated from these values, so nothing in it needs editing." }}
+      {{- end }}
+      {{- if not ($seal.plugin.registryCA).configMap }}
+{{- fail "openbao-platform: seal.plugin.fetch.enabled is true but seal.plugin.registryCA.configMap is empty. The fetch container sets CURL_CA_BUNDLE from registryCA, so curl would be pointed at a path that does not exist and fail before it reaches the network. Name the ConfigMap, or delete the CURL_CA_BUNDLE env entry from the container if Artifactory presents a publicly-trusted certificate." }}
+      {{- end }}
+      {{- $am := ($f.auth).method | default "none" }}
+      {{- if not (has $am (list "none" "bearerSecret" "serviceAccount")) }}
+{{- fail (printf "openbao-platform: seal.plugin.fetch.auth.method is %q; supported values are \"none\", \"bearerSecret\" and \"serviceAccount\"." $am) }}
+      {{- end }}
+      {{- if eq $am "bearerSecret" }}
+        {{- if not (($f.auth).bearerSecret).name }}
+{{- fail "openbao-platform: seal.plugin.fetch.auth.method is \"bearerSecret\" but fetch.auth.bearerSecret.name is empty." }}
+        {{- end }}
+      {{- end }}
+      {{- if eq $am "serviceAccount" }}
+        {{- $sa := ($f.auth).serviceAccount | default dict }}
+        {{- if not $sa.audience }}
+{{- fail "openbao-platform: seal.plugin.fetch.auth.method is \"serviceAccount\" but fetch.auth.serviceAccount.audience is empty. It must equal the audience the Artifactory OIDC provider accepts — the auto-mounted token's default API-server audience is not it, which is the whole reason a token is projected here." }}
+        {{- end }}
+        {{- if and $sa.tokenUrl (not $sa.providerName) }}
+{{- fail "openbao-platform: fetch.auth.serviceAccount.tokenUrl is set but providerName is empty. The exchange names the OIDC provider whose identity mapping grants read on the repo; without it Artifactory answers 400." }}
+        {{- end }}
+        {{- if and $sa.providerName (not $sa.tokenUrl) }}
+{{- fail "openbao-platform: fetch.auth.serviceAccount.providerName is set but tokenUrl is empty, so no exchange happens and the raw Kubernetes token would be sent as the Bearer — which Artifactory rejects. Set tokenUrl to https://<artifactory>/access/api/v1/oidc/token, or clear providerName if the endpoint really does accept the projected token directly." }}
+        {{- end }}
+        {{- if lt (int ($sa.expirationSeconds | default 3600)) 600 }}
+{{- fail (printf "openbao-platform: fetch.auth.serviceAccount.expirationSeconds is %v. Kubernetes enforces a 600 second floor and silently raises anything lower, so the value here would not be what the pod gets." $sa.expirationSeconds) }}
+        {{- end }}
+        {{/* server.volumes is not templated by the subchart, so the projected
+             token volume has to be listed literally and matched here. */}}
+        {{- $tokVol := false }}
+        {{- range ($server.volumes | default list) }}
+          {{- range (.projected).sources | default list }}
+            {{- if eq ((.serviceAccountToken).audience | default "") $sa.audience }}{{ $tokVol = true }}{{ end }}
+          {{- end }}
+        {{- end }}
+        {{- if not $tokVol }}
+{{- fail (printf "openbao-platform: no entry in openbao.server.volumes projects a serviceAccountToken with audience %q. The fetch container reads the token from %s/token, so without that volume it would find nothing and the download would be unauthenticated." $sa.audience $sa.mountPath) }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- if and (eq ($seal.plugin.source | default "preloaded") "preloaded") $seal.autoDownload }}
+{{- fail "openbao-platform: seal.plugin.source is \"preloaded\" but seal.autoDownload is true. plugin_auto_download only governs OCI downloads, which this path does not use, so it grants the server pointless registry egress and misleads the next reader into thinking the image is fetched. Set seal.autoDownload=false." }}
     {{- end }}
     {{- if not (has ($seal.downloadBehavior | default "fail") (list "fail" "warn")) }}
 {{- fail (printf "openbao-platform: seal.downloadBehavior is %q; it must be \"fail\" or \"warn\" (it renders plugin_download_behavior). Anything else is rejected by the server at startup." $seal.downloadBehavior) }}

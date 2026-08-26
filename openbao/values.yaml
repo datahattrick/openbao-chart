@@ -634,9 +634,9 @@ auditProxy:
   # they disagree, because one side would speak plaintext to a TLS listener.
   #
   # The http audit device takes no CA option, so OpenBao validates this hop
-  # against its process trust store. openbao.server.extraEnvironmentVars sets
-  # SSL_CERT_DIR to the backend CA's mount, which Go ADDS to the system roots,
-  # so public CAs keep working for the seal and GitLab OIDC.
+  # against its process trust store. openbao.server.extraEnvironmentVars puts
+  # the backend CA's mount in SSL_CERT_DIR; public roots keep working for the
+  # seal and GitLab OIDC because Go reads its default bundle file separately.
   tls:
     enabled: true
     # Issued by the BACKEND CA — the proxy is a backend component. Requires
@@ -735,11 +735,20 @@ openbao:
     logLevel: info
     logFormat: json
 
-    # Go ADDS every certificate in these directories to the system roots rather
-    # than replacing them, so the backend CA becomes trusted for outbound TLS
-    # while public CAs keep working. This is what lets the http audit device —
-    # which takes no CA option of its own — POST over https to the audit proxy.
-    # KEEP IN SYNC with tls.internal.mountPath.
+    # Trust for OpenBao's OUTBOUND TLS: the http audit device (which takes no
+    # CA option of its own), and the registry the seal plugin image is pulled
+    # from. Both validate against the process trust store, nothing narrower.
+    #
+    # SSL_CERT_DIR REPLACES Go's default certificate DIRECTORIES; public roots
+    # survive only because Go separately reads a default bundle FILE
+    # (/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem on the UBI image), which
+    # SSL_CERT_FILE would replace — so never set that one. Two consequences:
+    # the list is colon-separated and every directory you need must be in it,
+    # and dropping tls.internal.mountPath from it silently breaks the audit hop.
+    #
+    # KEEP IN SYNC with tls.internal.mountPath and, when the seal plugin is
+    # pulled from a registry behind a private CA, seal.plugin.registryCA.mountPath.
+    # The render fails if either is missing.
     extraEnvironmentVars:
       SSL_CERT_DIR: /openbao/tls/internal
 
@@ -851,12 +860,16 @@ openbao:
         # MUST equal seal.type to shadow the built-in.
         name: azurekeyvault
 
-        #   oci        OpenBao pulls the image and extracts the binary,
-        #              verifying sha256sum. Point `image` at your own registry
-        #              for an airgap.
         #   preloaded  The binary is already in `directory`, put there by an
-        #              initContainer or baked into a derived image.
-        source: oci
+        #              initContainer (see `fetch` below) or baked into a
+        #              derived image. Artifactory serves the release tarball
+        #              from a generic repo, and the fetch step authenticates
+        #              with the pod's own ServiceAccount.
+        #   oci        OpenBao pulls the image itself and extracts the binary.
+        #              Fewer moving parts on paper, but the credential and CA
+        #              plumbing all lands inside the server process: see
+        #              registryCA and registryAuth below.
+        source: preloaded
 
         # source: oci — a multi-arch index; OpenBao selects the right platform.
         #
@@ -887,10 +900,119 @@ openbao:
         # Defaults to binaryName.
         command: ""
 
+        # -------------------------------------------------------------------
+        # source: preloaded — fetch the release tarball before OpenBao starts
+        # -------------------------------------------------------------------
+        # Drives the `fetch-seal-plugin` initContainer. That container lives in
+        # openbao.server.extraInitContainers, which the subchart renders with
+        # `tpl`, so it reads these values directly and cannot drift from them.
+        # A worked copy is in examples/values-azure.yaml; the render fails if
+        # this is enabled and the container is missing.
+        fetch:
+          enabled: false
+          # Full URL of the tarball in Artifactory's generic repo.
+          url: ""
+
+          image: docker.io/curlimages/curl:8.11.1
+          imagePullPolicy: IfNotPresent
+          # NOTE: resources are set on the initContainer itself, not here.
+          # extraInitContainers is a values FILE that must parse as YAML before
+          # tpl runs, so a map cannot be templated into it — only scalars can.
+
+          auth:
+            #   none            anonymous download
+            #   bearerSecret    a long-lived token from a Secret
+            #   serviceAccount  the pod's own ServiceAccount, projected with an
+            #                   explicit audience and exchanged for an
+            #                   Artifactory access token. No stored credential.
+            method: none
+
+            bearerSecret:
+              name: ""
+              key: token
+
+            serviceAccount:
+              # Audience the token is minted for. MUST match the audience the
+              # Artifactory OIDC provider is configured to accept — the default
+              # API-server audience will not do, which is why this projects its
+              # own token rather than reusing the auto-mounted one.
+              audience: ""
+              # Kubernetes enforces a 600s floor. The token is used once, at
+              # startup, so there is no reason to go long.
+              expirationSeconds: 3600
+              # Where the projected token is mounted in the initContainer.
+              mountPath: /var/run/secrets/artifactory
+
+              # JFrog OIDC token exchange (RFC 8693). The projected token is
+              # POSTed here and the `access_token` from the reply is used as the
+              # Bearer for the download.
+              #   https://<artifactory>/access/api/v1/oidc/token
+              # Leave EMPTY to send the projected token straight through as the
+              # Bearer instead, for a gateway that accepts it directly.
+              tokenUrl: ""
+              # The OIDC provider's name in Artifactory. Required with tokenUrl;
+              # the identity mapping on it is what grants read on the repo.
+              providerName: ""
+
         # REQUIRED. OpenBao verifies the binary against it. Published in
         # checksums-kms-<provider>.txt, per-architecture — an arm64 node needs
         # the arm64 line.
         sha256sum: ""
+
+        # Private CA for Artifactory. Used by BOTH sources: source=oci needs it
+        # in the server's trust store (SSL_CERT_DIR, below), source=preloaded
+        # passes it to curl in the fetch initContainer as CURL_CA_BUNDLE.
+        #
+        # The SERVER process performs the pull, and there is no per-plugin CA
+        # option, so the CA has to be in its trust store. Without it startup
+        # fails with `x509: certificate signed by unknown authority` from the
+        # download, not from the seal.
+        #
+        # Setting configMap here does not itself mount anything — Helm cannot
+        # template subchart values. It declares the intent, and the render then
+        # fails unless openbao.server.volumes, .volumeMounts and
+        # .extraEnvironmentVars.SSL_CERT_DIR all agree. See values-azure.yaml.
+        registryCA:
+          # ConfigMap holding the PEM bundle. Empty -> public roots only.
+          configMap: ""
+          # Key inside it. Every key in the ConfigMap is read, so this only
+          # documents which one carries the bundle.
+          key: ca-bundle.crt
+          # Mount point, and the entry to add to SSL_CERT_DIR. Its own
+          # directory: SSL_CERT_DIR reads a whole directory, and the backend
+          # CA's mount is a Secret that cannot be merged with a ConfigMap.
+          mountPath: /openbao/tls/registry
+
+        # source: oci ONLY — credentials for that registry. The preloaded path
+        # authenticates in the initContainer instead; see `fetch.auth`.
+        #
+        # NOT an imagePullSecret: the kubelet is not doing this pull, the
+        # server process is, and it reads Docker/Podman config files. Of the
+        # four places it looks, DOCKER_CONFIG is the only one that wins
+        # deterministically — $HOME/.docker/config.json is consulted first, and
+        # REGISTRY_AUTH_FILE only if no Docker config was found at all.
+        #
+        # With no credentials found the pull is attempted ANONYMOUSLY rather
+        # than failing, so a private repo answers 401/403 and the error names
+        # the registry, not the missing Secret.
+        #
+        # Declaring secretName mounts nothing by itself; the render fails
+        # unless openbao.server.volumes, .volumeMounts and
+        # .extraEnvironmentVars.DOCKER_CONFIG agree. See values-azure.yaml.
+        registryAuth:
+          # Secret holding the credentials. Normally a
+          # kubernetes.io/dockerconfigjson from
+          #   kubectl create secret docker-registry <name> \
+          #     --docker-server=... --docker-username=... --docker-password=...
+          # An existing imagePullSecret can be reused as-is.
+          secretName: ""
+          # Key inside it. `.dockerconfigjson` is what that Secret type uses.
+          key: .dockerconfigjson
+          # Directory DOCKER_CONFIG points at. The volume MUST rename the key
+          # to `config.json` with `items` — the loader looks for exactly that
+          # filename, and a Secret mounted without items produces a file named
+          # after the key, which is silently not found.
+          mountPath: /openbao/.docker
 
         args: []
         env: []

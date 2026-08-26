@@ -42,33 +42,51 @@ Two delivery paths, both airgap-capable. `seal.plugin.source` picks one.
 flowchart TB
     art[("Artifactory")]
 
-    subgraph oci["source: oci  — fewest moving parts"]
+    subgraph pre["source: preloaded — the default"]
+        direction TB
+        p1["initContainer: curl tarball<br/><i>auth: the pod's ServiceAccount</i>"] --> p2["sha256sum -c<br/><i>refuses to install on mismatch</i>"] --> p3["install -m 0755 into<br/>plugin_directory (emptyDir)"]
+    end
+
+    subgraph oci["source: oci"]
         direction TB
         o1["OpenBao pulls the OCI image itself"] --> o2["extracts binary"] --> o3["verifies sha256sum"]
     end
 
-    subgraph pre["source: preloaded — for a generic repo"]
-        direction TB
-        p1["initContainer: curl tarball"] --> p2["sha256sum -c<br/><i>refuses to install on mismatch</i>"] --> p3["install -m 0755 into<br/>plugin_directory (emptyDir)"]
-    end
-
-    art -->|"Docker repo"| oci
     art -->|"generic repo"| pre
-    oci --> pd[("plugin_directory<br/>/openbao/plugins")]
-    pre --> pd
+    art -->|"Docker repo"| oci
+    pre --> pd[("plugin_directory<br/>/openbao/plugins")]
+    oci --> pd
     pd --> bao["OpenBao verifies sha256sum again,<br/>then loads the seal"]
 
-    style oci fill:#eef,stroke:#88a
     style pre fill:#efe,stroke:#4a4
+    style oci fill:#eef,stroke:#88a
 ```
 
 **`sha256sum` is mandatory either way** — OpenBao verifies the binary against it
 on load. That is precisely what makes pulling from a mirror or Artifactory safe,
 and why the chart refuses to render without it.
 
-Use `preloaded` when Artifactory serves the release tarball from a *generic*
-repo rather than as an OCI image, or when the OpenBao pod itself is not allowed
-egress to a registry. Use `oci` otherwise.
+### Why `preloaded` is the default
+
+`oci` looks like the smaller option — no initContainer — but every piece of
+Artifactory plumbing then has to live *inside the server process*, where OpenBao
+gives you almost no control over it:
+
+| | `preloaded` | `oci` |
+|---|---|---|
+| Who talks to Artifactory | curl, in an initContainer | the OpenBao server process |
+| Credentials | any of three methods, incl. the pod's ServiceAccount | a `dockerconfigjson` file found by a fixed search order |
+| Missing credentials | curl fails loudly | pulls **anonymously**, 401 looks like a wrong password |
+| Private CA | `CURL_CA_BUNDLE`, scoped to curl | must enter OpenBao's own trust store via `SSL_CERT_DIR` |
+| Failure surface | one container, one log line | server startup, mixed in with the seal |
+
+The decisive one is the CA. On `oci` the registry's CA has to be trusted by
+OpenBao itself, which means editing `SSL_CERT_DIR` — the same variable the http
+audit device depends on, and one that *replaces* Go's defaults rather than
+extending them. On `preloaded` OpenBao never talks to Artifactory at all, so its
+trust store is left alone.
+
+Reach for `oci` only if you cannot run an initContainer.
 
 ### The two binary names
 
@@ -117,6 +135,191 @@ render if either is set without it.
 
 `downloadBehavior` renders `plugin_download_behavior`, whose accepted values are
 `fail` and `warn`.
+
+### Authenticating with the pod's ServiceAccount
+
+`fetch.auth.method: serviceAccount` is the option with nothing long-lived to
+store. Kubernetes projects a short-lived token into the pod, the initContainer
+trades it for an Artifactory access token, and both are gone when the container
+exits.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as kubelet
+    participant I as fetch-seal-plugin (initContainer)
+    participant A as Artifactory
+    participant P as plugin_directory
+
+    K->>I: project SA token<br/>aud: <fetch.auth.serviceAccount.audience><br/>exp: 3600s
+    I->>A: POST /access/api/v1/oidc/token<br/>grant_type=token-exchange<br/>subject_token=<SA JWT><br/>provider_name=<provider>
+    A->>A: match identity mapping<br/>sub = system:serviceaccount:ns:sa
+    A-->>I: access_token
+    I->>A: GET tarball<br/>Authorization: Bearer <access_token>
+    A-->>I: tarball
+    I->>I: sha256sum -c<br/>refuses to install on mismatch
+    I->>P: install -m 0755
+```
+
+The Artifactory side is an OIDC provider whose identity mapping binds
+`sub = system:serviceaccount:<namespace>:<serviceaccount>` and grants read on
+the generic repo. Three things have to line up, and the chart checks all three:
+
+- `fetch.auth.serviceAccount.audience` must equal the audience the provider
+  accepts. It is **not** the auto-mounted token's audience — that one is the API
+  server's, which Artifactory will not take, and it is why the chart projects a
+  token of its own rather than reusing `/var/run/secrets/kubernetes.io/…`.
+- `openbao.server.volumes` must carry the matching `projected` volume, since the
+  subchart does not template that list.
+- `tokenUrl` and `providerName` go together. `providerName` without `tokenUrl`
+  would send the raw Kubernetes token as the Bearer, which Artifactory rejects.
+
+`expirationSeconds` has a **600 second floor** in Kubernetes, which is applied
+silently — set anything lower and the pod gets 600 anyway, so the chart fails
+the render instead.
+
+Two details in the script worth keeping if you adapt it:
+
+- **Neither token goes through `argv`.** The exchange body is passed as
+  `-d @file` and the download header through a `curl -K` config file, so
+  nothing sensitive appears in `ps`. `-H "Authorization: Bearer $TOKEN"` would.
+- **An empty `access_token` is checked explicitly.** An identity mapping that
+  matches nothing still answers `200`, so `curl -f` does not catch it and the
+  download would silently proceed unauthenticated.
+
+The other two methods: `bearerSecret` reads a long-lived token from a Secret
+into `ARTIFACTORY_TOKEN`, and `none` downloads anonymously.
+
+### A registry behind a private CA
+
+`seal.plugin.registryCA` names the bundle for both sources, but they consume it
+very differently.
+
+On **`preloaded`** it becomes `CURL_CA_BUNDLE` on the fetch container — scoped
+to curl, and OpenBao's own trust store is untouched. That is all it takes.
+
+On **`oci`** the *server process* performs the pull and the plugin stanza has no
+CA option, so the CA has to enter OpenBao's trust store. Missing, it surfaces as
+`x509: certificate signed by unknown authority` from the plugin download rather
+than from the seal. The rest of this section is about that case. Three things have to agree, and because
+Helm cannot template subchart values none of them follows from the others — the
+chart fails the render if any is missing:
+
+```yaml
+openbao:
+  server:
+    seal:
+      plugin:
+        registryCA:
+          configMap: artifactory-ca-bundle
+          key: ca-bundle.crt
+          mountPath: /openbao/tls/registry
+
+    volumes:
+      - name: registry-ca
+        configMap: { name: artifactory-ca-bundle }
+    volumeMounts:
+      - { name: registry-ca, mountPath: /openbao/tls/registry, readOnly: true }
+
+    extraEnvironmentVars:
+      SSL_CERT_DIR: /openbao/tls/internal:/openbao/tls/registry
+```
+
+Give it **its own directory**: `SSL_CERT_DIR` reads a directory whole, and the
+backend CA's mount is a Secret that cannot be merged with a ConfigMap.
+
+> **`SSL_CERT_DIR` replaces, it does not extend.** Go reads only the directories
+> named there — the default `/etc/ssl/certs` and friends drop out — so the list
+> is colon-separated and every directory you need must appear in it. Losing
+> `/openbao/tls/internal` while adding the registry breaks the http audit
+> device, which takes no CA option either, and a failing audit device stops
+> OpenBao serving requests. The chart checks for that entry too.
+>
+> Public roots are unaffected: they come from a default bundle **file**
+> (`/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem` on the UBI image) that
+> `SSL_CERT_DIR` does not touch. `SSL_CERT_FILE` *would* replace it — never set
+> that one.
+
+A ConfigMap volume presents each key as a symlink into `..data/`. Go follows
+those (it only skips symlinks pointing within the same directory), so the bundle
+is read normally.
+
+### Registry credentials
+
+An **imagePullSecret does not reach this pull** — the kubelet is not making it.
+The server process reads Docker/Podman config files, in this order:
+
+1. `$HOME/.docker/config.json`
+2. `$DOCKER_CONFIG/config.json`
+3. `$REGISTRY_AUTH_FILE`
+4. `$XDG_RUNTIME_DIR/containers/auth.json`, then `$XDG_CONFIG_HOME/containers/auth.json`
+
+Finding none of them, it pulls **anonymously** rather than failing, so every way
+of getting this wrong looks identical from the outside: a 401 or 403 naming the
+registry, never the missing Secret.
+
+Use `DOCKER_CONFIG`. It is the only entry that wins deterministically — once any
+Docker config is found, the loader reads `config.Load($DOCKER_CONFIG)`, so
+whatever that variable points at is what gets used. `REGISTRY_AUTH_FILE` is
+consulted only when no Docker config was found anywhere.
+
+```yaml
+openbao:
+  server:
+    seal:
+      plugin:
+        registryAuth:
+          secretName: artifactory-pull
+          key: .dockerconfigjson
+          mountPath: /openbao/.docker
+
+    volumes:
+      - name: registry-auth
+        secret:
+          secretName: artifactory-pull
+          defaultMode: 0400
+          items:
+            - key: .dockerconfigjson    # `items` is NOT optional — see below
+              path: config.json
+    volumeMounts:
+      - { name: registry-auth, mountPath: /openbao/.docker, readOnly: true }
+
+    extraEnvironmentVars:
+      DOCKER_CONFIG: /openbao/.docker   # the DIRECTORY, not the file
+```
+
+The Secret is an ordinary `kubernetes.io/dockerconfigjson`, so an existing
+imagePullSecret can be reused as-is:
+
+```sh
+kubectl create secret docker-registry artifactory-pull -n openbao \
+  --docker-server=artifactory.example.com \
+  --docker-username=… --docker-password=…
+```
+
+> **`items` is not optional.** The loader opens `<DOCKER_CONFIG>/config.json` by
+> that exact filename. A Secret mounted plainly produces a file named after its
+> key — `.dockerconfigjson` — which is never found, and not found means
+> anonymous. The rename is what makes the mount work, and the chart fails the
+> render without it.
+
+`DOCKER_CONFIG` names the **directory**; pointing it at the file finds nothing.
+The chart checks that too, along with the volume and the volumeMount.
+
+#### Credentials cannot go in the reference
+
+There is no `oci://user:password@registry/repo` form, and no auth field in the
+plugin stanza. `image` is an OCI reference, not a URL: go-containerregistry
+validates the registry as an RFC 3986 **authority** —
+`url.Parse("//" + name)`, then `url.Host` must equal `name` — which both a
+scheme and a `user:pass@` prefix fail, before any pull is attempted.
+
+It would be the wrong place regardless. The server config is rendered into a
+**ConfigMap**, not a Secret, so a password there would be readable by anyone who
+can read ConfigMaps in the namespace — the same reason the transit seal's token
+comes from `extraSecretEnvironmentVars` and never from the config file.
+
+The chart fails the render on both forms and names `registryAuth` instead.
 
 The published `checksums-kms-azure.txt` line refers to the **tarball** name.
 Verified by extracting both and comparing hashes — identical
@@ -235,11 +438,22 @@ nor a second OpenBao. What was checked directly:
 - the split `image`/`version` reference, `plugin_auto_download` and
   `plugin_auto_register` were corrected against the upstream declarative-plugin
   docs after a live `image and version do not form a valid image reference`
+- the registry-CA and credential wiring render, and every way of getting either
+  half-right fails the render; the trust and credential mechanisms are read from
+  Go's `crypto/x509` and go-containerregistry's `authn` keychain, not tested
+  against a private registry
+- **the fetch script was rendered and then executed** against a stub standing in
+  for Artifactory: the exchange POSTs the RFC 8693 body with the projected
+  token, the download carries the *exchanged* token as its Bearer, the binary
+  installs 0755 under the right name, and all three credential-bearing temp
+  files are removed. A tampered checksum and an exchange answering 200 with no
+  `access_token` both abort before anything is installed. Not tested against a
+  real Artifactory OIDC provider
 - the plugin OCI image and release tarball were both fetched and their binaries
   hashed — identical bytes, and the published checksum matches
 - the fetch script's download → `sha256sum -c` → `install` logic was executed
   against the real artifact; a tampered binary is correctly refused
-- 15 negative tests against the validation rules, all caught
+- 38 negative tests against the validation rules, all caught
 
 Not verified without Azure: the federated token exchange and an actual
 wrap/unwrap against Key Vault.
