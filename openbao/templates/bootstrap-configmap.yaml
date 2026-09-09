@@ -319,7 +319,7 @@ data:
             if [ "$waited" -ge "$NODE_WAIT_TIMEOUT" ]; then
               warn "node ${n} never answered within ${NODE_WAIT_TIMEOUT}s."
               warn "Remaining nodes cannot start until it is Ready. Unseal it by"
-              warn "hand (scripts/unseal.sh) once it is up."
+              warn "hand once it is up: bao operator unseal, see docs/SEAL.md."
               break
             fi
             [ "$waited" = 5 ] && log "waiting for node ${n} to appear (it starts once node $((n - 1)) is Ready)"

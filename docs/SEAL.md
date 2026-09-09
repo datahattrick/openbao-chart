@@ -551,17 +551,30 @@ bootstrap:
 
 The value is mixed into the pod annotations, so it changes the pod-template hash, so the Job gets a new name and runs. Step 2 of the script unseals every replica from the keys in the init Secret. After `revokeRootToken` has already run, the rerun unseals, reports that there is nothing left to configure, and exits 0 — it does not fail the sync.
 
-**2. `scripts/unseal.sh` — from a shell.** Immediate, no commit, and the only option that works once the init Secret is gone:
+**2. By hand — from a shell.** Immediate, no commit, and the only option that works once the init Secret is gone. Feed `<threshold>` keys to every sealed replica:
 
 ```sh
-UNSEAL_KEYS="k1 k2 k3" ./deployment/scripts/unseal.sh
+for pod in $(kubectl -n openbao get pods \
+             -l app.kubernetes.io/name=openbao,component=server \
+             -o jsonpath='{.items[*].metadata.name}'); do
+  for key in "$KEY1" "$KEY2" "$KEY3"; do
+    kubectl -n openbao exec "$pod" -c openbao -- \
+      bao operator unseal -tls-skip-verify "$key"
+  done
+done
 ```
+
+`-tls-skip-verify` is safe here and only here: the CLI is talking to its own
+process inside the pod, so there is no network hop to authenticate. Unsealing an
+already-unsealed node is a no-op, so the loop is safe to re-run. Take the keys
+from a shell variable rather than typing them inline — as arguments they are
+visible in the pod's process list and in your shell history.
 
 **3. Auto-unseal.** The actual fix. Everything above is a human noticing that OpenBao is down.
 
 ### The constraint under all of this
 
-Options 1 and 2-without-`UNSEAL_KEYS` both read the unseal keys from the `<release>-init-keys` Secret. The install instructions tell you to take those keys off the cluster and delete that Secret, and you should — but that is exactly the same thing as deciding that **nothing in the cluster can unseal it**, and that a restart is a page for a human with the keys.
+Option 1 reads the unseal keys from the `<release>-init-keys` Secret, and option 2 needs you to hold them. The install instructions tell you to take those keys off the cluster and delete that Secret, and you should — but that is exactly the same thing as deciding that **nothing in the cluster can unseal it**, and that a restart is a page for a human with the keys.
 
 That trade is the whole argument for auto-unseal, and it is not avoidable by making the bootstrap cleverer. Any process that can unseal unattended can be made to unseal by an attacker who controls it; the only question is whether the thing holding that power is a Secret in this namespace or a KMS somewhere else. Leaving the keys in the namespace so a Job can use them means a `get secret` in that namespace is equivalent to the master key.
 

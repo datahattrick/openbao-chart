@@ -103,7 +103,7 @@ Rolling this cluster back to an earlier point. Seal config is unchanged, so no
 
 ```sh
 helm upgrade openbao openbao/ -n openbao \
-  -f values-heathernetes.yaml \
+  -f my-values.yaml \
   --set restore.enabled=true \
   --set restore.snapshot=bao_2026-08-19-2227.snapshot \
   --set restore.confirm=bao_2026-08-19-2227.snapshot \

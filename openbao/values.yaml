@@ -266,8 +266,8 @@ bootstrap:
   # It only works while the init-keys Secret still holds the unseal keys. Once
   # you have taken them off-cluster and deleted it — which the install
   # instructions tell you to do — nothing in-cluster can unseal, by design, and
-  # you want scripts/unseal.sh with UNSEAL_KEYS set. Auto-unseal is the real
-  # fix; see docs/SEAL.md.
+  # you unseal by hand with the keys you kept. Auto-unseal is the real fix;
+  # docs/SEAL.md covers both.
   rerun: ""
   # Overrides the top-level priorityClassName.
   priorityClassName: ""
