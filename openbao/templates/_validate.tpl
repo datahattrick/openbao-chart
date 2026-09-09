@@ -113,6 +113,26 @@ naming the value to fix.
   {{- end }}
 {{- end }}
 
+{{/* --- kubernetes auth method ---------------------------------------------- */}}
+{{- $ka := .Values.bootstrap.kubernetesAuth }}
+{{- if $ka.enabled }}
+  {{- if not $ka.host }}
+{{- fail "openbao-platform: bootstrap.kubernetesAuth.host is empty. kubernetes_host is the one required field of the auth mount's config, and OpenBao rejects the write with 'no host provided'. The in-cluster value is https://kubernetes.default.svc." }}
+  {{- end }}
+  {{- if not (has $ka.aliasNameSource (list "serviceaccount_uid" "serviceaccount_name")) }}
+{{- fail (printf "openbao-platform: bootstrap.kubernetesAuth.aliasNameSource is %q. It must be \"serviceaccount_uid\" or \"serviceaccount_name\"." $ka.aliasNameSource) }}
+  {{- end }}
+{{- end }}
+{{/* Values that belonged to the JWT auth method this mount replaced. Silently
+     ignoring them would leave an overlay believing it had pinned an issuer or
+     chosen a discovery mode that no longer exists. */}}
+{{- if hasKey $ka "discovery" }}
+{{- fail "openbao-platform: bootstrap.kubernetesAuth.discovery no longer exists. The mount is now the `kubernetes` auth method, which verifies tokens through the TokenReview API rather than discovering an OIDC issuer, so there is nothing to choose between. Remove the key; set kubernetesAuth.host if you were pointing at a non-default API server." }}
+{{- end }}
+{{- if hasKey $ka "boundIssuer" }}
+{{- fail "openbao-platform: bootstrap.kubernetesAuth.boundIssuer no longer exists. The kubernetes auth method does not validate the iss claim (disable_iss_validation defaults true upstream and is deprecated); the API server's own answer to the TokenReview is the check. Remove the key. bootstrap.gitlab.boundIssuer is unaffected." }}
+{{- end }}
+
 {{/* --- snapshot agent wiring ---------------------------------------------- */}}
 {{- if ($bao.snapshotAgent).enabled }}
 {{- fail "openbao-platform: openbao.snapshotAgent.enabled must stay false — this chart ships its own CronJob so that concurrencyPolicy can be set (the subchart's template does not expose it). Use the top-level `snapshotAgent` section instead." }}
@@ -126,10 +146,10 @@ naming the value to fix.
 {{- fail (printf "openbao-platform: snapshotAgent.auth.role is %q but bootstrap.snapshot.role is %q. The agent would request a role that does not exist." $snap.auth.role .Values.bootstrap.snapshot.role) }}
   {{- end }}
   {{- if ne $snap.auth.audience .Values.bootstrap.kubernetesAuth.audience }}
-{{- fail (printf "openbao-platform: snapshotAgent.auth.audience is %q but bootstrap.kubernetesAuth.audience is %q. The JWT role binds that audience, so every login would fail with 'invalid audience'." $snap.auth.audience .Values.bootstrap.kubernetesAuth.audience) }}
+{{- fail (printf "openbao-platform: snapshotAgent.auth.audience is %q but bootstrap.kubernetesAuth.audience is %q. The kubernetes role sets `audience` to the latter and the TokenReview is made with it, so every login would fail with 'invalid audience'." $snap.auth.audience .Values.bootstrap.kubernetesAuth.audience) }}
   {{- end }}
   {{- if not .Values.bootstrap.snapshot.enabled }}
-{{- fail "openbao-platform: snapshotAgent.enabled is true but bootstrap.snapshot.enabled is false, so no policy or JWT role would be created for it and every snapshot would fail with a 403." }}
+{{- fail "openbao-platform: snapshotAgent.enabled is true but bootstrap.snapshot.enabled is false, so no policy or kubernetes role would be created for it and every snapshot would fail with a 403." }}
   {{- end }}
   {{- if not (or $snap.s3.credentialsSecret $snap.s3.baoSecretPath) }}
 {{- fail "openbao-platform: snapshotAgent is enabled but has no S3 credentials. Set snapshotAgent.s3.credentialsSecret, or s3.baoSecretPath to read them from OpenBao." }}

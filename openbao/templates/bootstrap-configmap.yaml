@@ -410,73 +410,61 @@ data:
       bao policy write "$name" "$f" >/dev/null
     done
 
-    # -- 3c. JWT/OIDC for Kubernetes service accounts ----------------------
+    # -- 3c. Kubernetes auth for cluster service accounts ------------------
     if [ "$K8S_AUTH_ENABLED" = "true" ]; then
       if has_auth "$K8S_AUTH_PATH"; then
         log "auth mount ${K8S_AUTH_PATH}/ already enabled"
       else
-        log "enabling jwt auth at ${K8S_AUTH_PATH}/"
-        bao auth enable -path="$K8S_AUTH_PATH" jwt >/dev/null
+        log "enabling kubernetes auth at ${K8S_AUTH_PATH}/"
+        bao auth enable -path="$K8S_AUTH_PATH" kubernetes >/dev/null
       fi
 
-      # Written through stdin as JSON: provider_config is a nested object and
-      # the CLI's key=value form would submit it as a string.
-      log "configuring ${K8S_AUTH_PATH}/ against the cluster's OIDC issuer"
-      if [ "$K8S_AUTH_DISCOVERY" = "jwks" ]; then
-        # Explicit JWKS. Needs the API server to serve the endpoint to this
-        # caller -- see docs/AUTH.md.
-        CA_PEM="$(awk '{printf "%s\\n", $0}' /var/run/secrets/kubernetes.io/serviceaccount/ca.crt)"
-        cat > "$WORK/jwtcfg.json" <<JSONEOF
-    {
-      "jwks_url": "https://kubernetes.default.svc.cluster.local/openid/v1/jwks",
-      "jwks_ca_pem": "${CA_PEM}"
-    }
-    JSONEOF
-      else
-        # In-cluster discovery via the built-in `kubernetes` provider.
-        #
-        # provider_config is a discovery method in its OWN RIGHT, and OpenBao
-        # enforces "exactly one of jwt_validation_pubkeys, jwks_url, jwks_pairs,
-        # oidc_discovery_url or provider_config". Sending oidc_discovery_url
-        # alongside it is rejected twice over -- once by that count, and again
-        # by the provider itself, which errors with "oidc_discovery_url must not
-        # be set when using the kubernetes provider".
-        #
-        # The provider deliberately does NOT accept a URL: it builds one from
-        # KUBERNETES_SERVICE_HOST/PORT and authenticates with the pod's own
-        # service account token and CA. That is what makes this need no extra
-        # RBAC, no anonymous discovery access, and no egress off the cluster.
-        cat > "$WORK/jwtcfg.json" <<JSONEOF
-    {
-      "provider_config": { "provider": "kubernetes" }$(
-        [ -n "${K8S_BOUND_ISSUER:-}" ] && printf ',\n  "bound_issuer": "%s"' "$K8S_BOUND_ISSUER"
-      )
-    }
-    JSONEOF
+      # kubernetes_host is the ONLY required field. It is a runtime dependency
+      # of every login, not just of this Job: the method verifies a token by
+      # POSTing a TokenReview to that endpoint, so if it is unreachable the
+      # snapshot agent cannot authenticate.
+      #
+      # kubernetes_ca_cert and token_reviewer_jwt are deliberately left unset
+      # unless asked for. Unset, OpenBao reads the pod's own ca.crt and
+      # ServiceAccount token from /var/run/secrets — no Secret to manage, no
+      # egress, correct in an airgap. Using its own token for the review is
+      # exactly why the server ServiceAccount must hold system:auth-delegator;
+      # without it every login fails 403 at the API server.
+      log "configuring ${K8S_AUTH_PATH}/ against ${K8S_AUTH_HOST}"
+      set -- kubernetes_host="$K8S_AUTH_HOST"
+      if [ -n "${K8S_AUTH_CA_CERT:-}" ]; then
+        set -- "$@" kubernetes_ca_cert="$K8S_AUTH_CA_CERT"
       fi
-      sed -i 's/^    //' "$WORK/jwtcfg.json"
-      bao write "auth/${K8S_AUTH_PATH}/config" - < "$WORK/jwtcfg.json" >/dev/null
+      if [ -n "${K8S_TOKEN_REVIEWER_JWT:-}" ]; then
+        set -- "$@" token_reviewer_jwt="$K8S_TOKEN_REVIEWER_JWT"
+      fi
+      bao write "auth/${K8S_AUTH_PATH}/config" "$@" >/dev/null
       log "configured ${K8S_AUTH_PATH}/"
 
       # -- the backup service account's identity --------------------------
       if [ "$SNAPSHOT_ENABLED" = "true" ]; then
-        log "creating jwt role ${SNAPSHOT_ROLE} for ${SNAPSHOT_SUBJECT}"
-        cat > "$WORK/snaprole.json" <<JSONEOF
-    {
-      "role_type": "jwt",
-      "bound_audiences": ["${K8S_AUTH_AUDIENCE}"],
-      "user_claim": "sub",
-      "bound_subject": "${SNAPSHOT_SUBJECT}",
-      "token_policies": ["${SNAPSHOT_POLICY}"],
-      "token_ttl": "${SNAPSHOT_TTL}",
-      "token_max_ttl": "${SNAPSHOT_MAX_TTL}",
-      "token_type": "service",
-      "token_no_default_policy": true
-    }
-    JSONEOF
-        sed -i 's/^    //' "$WORK/snaprole.json"
-        bao write "auth/${K8S_AUTH_PATH}/role/${SNAPSHOT_ROLE}" - < "$WORK/snaprole.json" >/dev/null
-        log "role ${SNAPSHOT_ROLE} bound to audience ${K8S_AUTH_AUDIENCE} and subject ${SNAPSHOT_SUBJECT}"
+        log "creating kubernetes role ${SNAPSHOT_ROLE} for ${SNAPSHOT_SA_NAMESPACE}/${SNAPSHOT_SA_NAME}"
+        # bound_service_account_names and bound_service_account_namespaces are
+        # the whole authorisation boundary. Both are required by OpenBao and
+        # neither may mix "*" with a real value, so there is no way to end up
+        # with a role that accidentally accepts every account in the cluster.
+        # `audience` additionally requires the projected token to carry OUR
+        # audience, so a token minted for the Kubernetes API cannot be replayed
+        # here.
+        set -- \
+          bound_service_account_names="$SNAPSHOT_SA_NAME" \
+          bound_service_account_namespaces="$SNAPSHOT_SA_NAMESPACE" \
+          alias_name_source="$K8S_ALIAS_SOURCE" \
+          token_policies="$SNAPSHOT_POLICY" \
+          token_ttl="$SNAPSHOT_TTL" \
+          token_max_ttl="$SNAPSHOT_MAX_TTL" \
+          token_type=service \
+          token_no_default_policy=true
+        if [ -n "${K8S_AUTH_AUDIENCE:-}" ]; then
+          set -- "$@" audience="$K8S_AUTH_AUDIENCE"
+        fi
+        bao write "auth/${K8S_AUTH_PATH}/role/${SNAPSHOT_ROLE}" "$@" >/dev/null
+        log "role ${SNAPSHOT_ROLE} bound to serviceaccount ${SNAPSHOT_SA_NAMESPACE}/${SNAPSHOT_SA_NAME}, audience ${K8S_AUTH_AUDIENCE}"
       fi
     fi
 

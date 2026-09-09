@@ -331,24 +331,53 @@ bootstrap:
   # Kubernetes auth method: no TokenReview call and no egress. Note that JWT
   # auth only validates signatures, so a token revoked in Kubernetes stays valid
   # here until it expires — keep the TTLs short. See docs/AUTH.md.
+  # The `kubernetes` auth method. Every login is verified by POSTing a
+  # TokenReview to the API server, so a token revoked in Kubernetes stops
+  # working here immediately — which a signature check cannot do.
   kubernetesAuth:
     enabled: true
     path: kubernetes
-    # Audience stamped into the projected tokens and enforced by
-    # bound_audiences. Keep it off the default API server audience so the token
+    # The API server OpenBao calls to verify tokens. This is a RUNTIME
+    # dependency of every login, not just of the bootstrap: if it is
+    # unreachable the snapshot CronJob cannot authenticate.
+    host: https://kubernetes.default.svc
+    # CA for that call. Empty means OpenBao reads the pod's own
+    # /var/run/secrets/kubernetes.io/serviceaccount/ca.crt — correct in-cluster,
+    # needs no Secret, and works in an airgap. Set a PEM only when calling an
+    # API server whose CA is not the one that signed the pod's.
+    caCert: ""
+    # The JWT OpenBao presents when calling TokenReview. Empty means it uses its
+    # OWN ServiceAccount token, which is why the server ServiceAccount needs
+    # system:auth-delegator (see rbac below). Set this only to review with a
+    # different identity, e.g. against a remote cluster.
+    tokenReviewerJwt: ""
+    # Audience the projected token must carry, enforced by the role's
+    # `audience`. Keep it off the default API server audience so the token
     # cannot be replayed against the Kubernetes API.
     # KEEP IN SYNC with snapshotAgent.auth.audience
     audience: openbao
-    # Static issuer URL to pin bound_issuer. Empty accepts whatever discovery
-    # returns.
-    boundIssuer: ""
-    # in-cluster | jwks
-    #   in-cluster  OpenBao discovers the issuer with its own token and CA. No
-    #               extra RBAC, no egress. Correct in an airgap.
-    #   jwks        Reads /openid/v1/jwks directly, which usually requires
-    #               binding system:service-account-issuer-discovery to
-    #               system:unauthenticated. Use only if in-cluster fails.
-    discovery: in-cluster
+    # serviceaccount_uid | serviceaccount_name
+    #   serviceaccount_uid   the identity does not transfer when a
+    #                        ServiceAccount is deleted and recreated under the
+    #                        same name. Upstream default, and the safe one.
+    #   serviceaccount_name  puts <namespace>/<name> in the audit trail instead
+    #                        of a uuid, at the cost of the above.
+    aliasNameSource: serviceaccount_uid
+    rbac:
+      # Bind system:auth-delegator to the OpenBao server ServiceAccount.
+      #
+      # The binding itself is REQUIRED — the kubernetes auth method validates
+      # every login through the TokenReview API, and without it each one fails
+      # with a 403. What is optional is whether THIS CHART creates it, because
+      # a ClusterRoleBinding is cluster-scoped and the identity installing the
+      # chart often cannot write one. That is the price of this method over
+      # JWT, which verified signatures locally and touched no cluster RBAC.
+      #
+      # false does not fail the render: a cluster admin applying the binding
+      # separately is a supported way to run this. The install notes print the
+      # exact manifest to hand them, and warn that logins 403 until it exists.
+      # docs/AUTH.md has the same manifest.
+      create: true
 
   # The backup service account's OIDC identity and its policy.
   snapshot:

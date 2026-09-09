@@ -1,12 +1,18 @@
 # Authentication
 
-Both consumers use the **JWT** auth method rather than the Kubernetes auth
-method. One auth model instead of two, no `TokenReview` call on every login, and
-no `system:auth-delegator` binding.
+Two auth mounts, deliberately different methods. Kubernetes service accounts
+use the **Kubernetes** auth method; GitLab CI uses the **JWT** method, because
+there is no TokenReview API on the other side of the internet.
 
-The trade-off worth stating: JWT auth validates signatures, so a token revoked
-in Kubernetes stays valid to OpenBao until it expires. Keep TTLs short — this
-chart uses 30m with a 10m projected token.
+The Kubernetes method does not check a signature. It hands the token to the API
+server (`POST /apis/authentication.k8s.io/v1/tokenreviews`) and believes the
+answer. That costs a live call to the API server on every login and a
+`system:auth-delegator` ClusterRoleBinding, and it buys **immediate
+revocation**: delete the ServiceAccount and the next login fails. JWT auth,
+which this mount used previously, verified the signature locally and needed
+neither — at the price that a token revoked in Kubernetes stayed good to
+OpenBao until it expired. TTLs stay short regardless: 30m tokens from a 10m
+projected token.
 
 ## Backup service account
 
@@ -23,9 +29,9 @@ sequenceDiagram
     Note over K,C: audience-bound, so it cannot be<br/>replayed against the Kubernetes API
 
     C->>B: POST auth/kubernetes/login<br/>role=bao-snapshot, jwt=<token>
-    B->>A: fetch JWKS<br/><i>URL derived from KUBERNETES_SERVICE_HOST,<br/>authenticated with OpenBao's own SA token</i>
-    A-->>B: signing keys
-    B->>B: verify signature<br/>check bound_audiences = openbao<br/>check bound_subject = system:serviceaccount:openbao:openbao-snapshot
+    B->>A: TokenReview<br/><i>to kubernetes_host, as OpenBao's OWN SA token<br/>— needs system:auth-delegator</i>
+    A-->>B: valid, sa=openbao-snapshot ns=openbao aud=[openbao]
+    B->>B: check bound_service_account_names<br/>check bound_service_account_namespaces<br/>check audience = openbao
     B-->>C: token, policies=[raft-snapshot], ttl=30m
 
     C->>B: GET sys/storage/raft/snapshot
@@ -35,26 +41,60 @@ sequenceDiagram
 
 Configured by the bootstrap as:
 
-```json
-{ "provider_config": { "provider": "kubernetes" } }
+```sh
+bao write auth/kubernetes/config kubernetes_host=https://kubernetes.default.svc
+
+bao write auth/kubernetes/role/bao-snapshot \
+  bound_service_account_names=openbao-snapshot \
+  bound_service_account_namespaces=openbao \
+  audience=openbao \
+  alias_name_source=serviceaccount_uid \
+  token_policies=raft-snapshot token_ttl=30m token_max_ttl=1h \
+  token_type=service token_no_default_policy=true
 ```
 
-**`provider_config` is a discovery method in its own right and must be used
-alone.** OpenBao enforces "exactly one of `jwt_validation_pubkeys`, `jwks_url`,
-`jwks_pairs`, `oidc_discovery_url` or `provider_config`", and the Kubernetes
-provider additionally rejects `oidc_discovery_url` outright. Sending both — which
-some documentation shows — fails with:
+`kubernetes_host` is the only required config field — OpenBao rejects the write
+with `no host provided` otherwise. `kubernetes_ca_cert` and `token_reviewer_jwt`
+are deliberately left unset: unset, OpenBao reads the pod's own
+`/var/run/secrets/kubernetes.io/serviceaccount/{ca.crt,token}`, so there is no
+Secret to manage, no egress, and it works in an airgap. Set either only when
+reviewing against an API server that is not the one that issued the pod's token.
 
-```
-exactly one of 'jwt_validation_pubkeys', 'jwks_url', 'jwks_pairs',
-'oidc_discovery_url', or 'provider_config' must be set
+**`bound_service_account_names` and `bound_service_account_namespaces` are the
+authorisation boundary.** Both are required by OpenBao, and neither may mix `*`
+with a real value, so a role cannot accidentally end up accepting every account
+in the cluster. `audience` is the third check: the projected token must carry
+`openbao`, so a token minted for the Kubernetes API cannot be replayed here.
+
+`alias_name_source` defaults to `serviceaccount_uid`, which means the identity
+does not transfer if the ServiceAccount is deleted and recreated under the same
+name. Set `serviceaccount_name` to get `openbao/openbao-snapshot` in the audit
+trail instead of a uuid, accepting that.
+
+### The RBAC this costs
+
+```yaml
+kind: ClusterRoleBinding
+roleRef: { kind: ClusterRole, name: system:auth-delegator }
+subjects: [{ kind: ServiceAccount, name: openbao, namespace: openbao }]
 ```
 
-The provider deliberately does not accept a URL: it builds one from
-`KUBERNETES_SERVICE_HOST`/`PORT` and authenticates with the pod's own service
-account token and CA. That is what makes it need no extra RBAC, no anonymous
-access to the discovery document, and **no egress off the cluster** — which is
-what makes it work in an airgap.
+Without it every login fails with a 403 from the API server, which surfaces to
+the client as a permission error from OpenBao and reads like a policy problem.
+
+The binding is required; **the chart creating it is not.** It is cluster-scoped
+— the most privileged object here, and the identity installing this chart very
+often cannot write one, especially when the chart is a dependency of a larger
+umbrella deployed by a namespace-scoped account. So
+`bootstrap.kubernetesAuth.rbac.create: false` is a supported configuration, not
+an error: it renders no binding, does not fail, and the install notes print the
+manifest above for a cluster admin to apply separately. Logins 403 until they
+do, and the bootstrap has to run again afterwards to finish configuring the
+mount.
+
+The third option is `tokenReviewerJwt`: a token for some other identity that
+already holds `system:auth-delegator`. Then the OpenBao ServiceAccount needs
+nothing, at the cost of a long-lived credential in a Secret.
 
 The policy is the whole authority the agent has:
 
@@ -66,17 +106,10 @@ with `token_no_default_policy`, so the identity does not also carry `default`.
 Confirmed in the audit trail:
 
 ```
-auth.display_name = kubernetes-system:serviceaccount:openbao:openbao-snapshot
+auth.display_name = kubernetes-openbao-snapshot
 auth.policies     = ["raft-snapshot"]
 request.path      = sys/storage/raft/snapshot
 ```
-
-### Alternative: explicit JWKS
-
-`bootstrap.kubernetesAuth.discovery: jwks` points at
-`/openid/v1/jwks` with the cluster CA instead. Use it only if the built-in
-provider fails, and note it usually requires binding
-`system:service-account-issuer-discovery` to `system:unauthenticated`.
 
 ## GitLab CI/CD → OpenTofu
 

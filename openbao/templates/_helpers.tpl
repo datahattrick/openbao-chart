@@ -255,3 +255,20 @@ NOTES.txt prints the same name the Job is actually created with.
 {{- $suffix := include "obp.jobNameSuffix" (dict "root" . "content" (include "obp.restorePodTemplate" .)) -}}
 {{- printf "%s-restore-%s" (include "obp.baoFullname" .) $suffix | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
+
+{{/*
+The OpenBao server's ServiceAccount, reproducing `openbao.serviceAccount.name`
+from the subchart. Needed because the kubernetes auth method reviews tokens
+with the server's own identity, so that identity is what has to hold
+system:auth-delegator.
+*/}}
+{{- define "obp.baoServiceAccountName" -}}
+{{- $bao := index .Values "openbao" | default dict -}}
+{{- $server := $bao.server | default dict -}}
+{{- $sa := $server.serviceAccount | default dict -}}
+{{- if eq ($sa.create | toString) "false" -}}
+{{- $sa.name | default "default" -}}
+{{- else -}}
+{{- $sa.name | default (include "obp.baoFullname" .) -}}
+{{- end -}}
+{{- end -}}

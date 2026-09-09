@@ -185,18 +185,29 @@ name it should tell you to tail.
               value: {{ .Values.bootstrap.kubernetesAuth.path | quote }}
             - name: K8S_AUTH_AUDIENCE
               value: {{ .Values.bootstrap.kubernetesAuth.audience | quote }}
-            - name: K8S_AUTH_DISCOVERY
-              value: {{ .Values.bootstrap.kubernetesAuth.discovery | default "in-cluster" | quote }}
-            - name: K8S_BOUND_ISSUER
-              value: {{ .Values.bootstrap.kubernetesAuth.boundIssuer | quote }}
+            - name: K8S_AUTH_HOST
+              value: {{ .Values.bootstrap.kubernetesAuth.host | quote }}
+            # Empty for both of these means OpenBao falls back to the pod's own
+            # ca.crt and ServiceAccount token, which is the in-cluster default
+            # and needs no Secret.
+            - name: K8S_AUTH_CA_CERT
+              value: {{ .Values.bootstrap.kubernetesAuth.caCert | quote }}
+            - name: K8S_TOKEN_REVIEWER_JWT
+              value: {{ .Values.bootstrap.kubernetesAuth.tokenReviewerJwt | quote }}
+            - name: K8S_ALIAS_SOURCE
+              value: {{ .Values.bootstrap.kubernetesAuth.aliasNameSource | quote }}
             - name: SNAPSHOT_ENABLED
               value: {{ .Values.bootstrap.snapshot.enabled | quote }}
             - name: SNAPSHOT_ROLE
               value: {{ .Values.bootstrap.snapshot.role | quote }}
             - name: SNAPSHOT_POLICY
               value: {{ .Values.bootstrap.snapshot.policyName | quote }}
-            - name: SNAPSHOT_SUBJECT
-              value: {{ printf "system:serviceaccount:%s:%s" $ns (.Values.snapshotAgent.serviceAccount.name | default (printf "%s-snapshot" $fullname)) | quote }}
+            # The kubernetes auth role binds the account by name and namespace
+            # rather than by a `sub` claim string, so both are passed whole.
+            - name: SNAPSHOT_SA_NAME
+              value: {{ .Values.snapshotAgent.serviceAccount.name | default (printf "%s-snapshot" $fullname) | quote }}
+            - name: SNAPSHOT_SA_NAMESPACE
+              value: {{ $ns | quote }}
             - name: SNAPSHOT_TTL
               value: {{ .Values.bootstrap.snapshot.tokenTtl | quote }}
             - name: SNAPSHOT_MAX_TTL

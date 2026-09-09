@@ -20,6 +20,36 @@ TRUST DOMAINS
   TLS IS DISABLED. Do not run this way outside a scratch cluster.
 {{- end }}
 
+{{- if and .Values.bootstrap.kubernetesAuth.enabled (not .Values.bootstrap.kubernetesAuth.rbac.create) }}
+
+  !! ACTION REQUIRED BEFORE ANY LOGIN WORKS
+  !! kubernetesAuth.rbac.create is false, so this release did NOT create the
+  !! ClusterRoleBinding the kubernetes auth method needs. OpenBao verifies every
+  !! login by POSTing a TokenReview as its own ServiceAccount, and until that
+  !! account can do so the API server answers 403 — the snapshot agent included.
+{{- if .Values.bootstrap.kubernetesAuth.tokenReviewerJwt }}
+  !!
+  !! You have set a tokenReviewerJwt, so this applies to THAT identity instead:
+  !! it must already hold system:auth-delegator.
+{{- else }}
+  !!
+  !! Give a cluster admin this, then re-run the bootstrap:
+  !!
+  !!   apiVersion: rbac.authorization.k8s.io/v1
+  !!   kind: ClusterRoleBinding
+  !!   metadata:
+  !!     name: {{ printf "%s-%s-auth-delegator" $ns $fullname | trunc 63 | trimSuffix "-" }}
+  !!   roleRef:
+  !!     apiGroup: rbac.authorization.k8s.io
+  !!     kind: ClusterRole
+  !!     name: system:auth-delegator
+  !!   subjects:
+  !!     - kind: ServiceAccount
+  !!       name: {{ include "obp.baoServiceAccountName" . }}
+  !!       namespace: {{ $ns }}
+{{- end }}
+{{- end }}
+
 NEXT STEPS
 {{ if .Values.bootstrap.enabled }}
   1. Watch the bootstrap Job. It initialises, unseals and configures the
