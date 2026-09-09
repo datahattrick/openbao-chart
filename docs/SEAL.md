@@ -536,6 +536,48 @@ what you kept**. Back up the Key Vault key, and see
 [RESTORE.md](RESTORE.md) — a snapshot is still worthless without the means to
 decrypt it.
 
+## Unsealing a restarted cluster
+
+This section is about the Shamir case. With auto-unseal configured, none of it applies — the node unseals itself and nothing has to run.
+
+Under Shamir, **any** pod restart seals the node: a reboot, an eviction, a `kubectl delete pod` to pick up a config change. Nothing in the cluster unseals it again, and no Kubernetes event triggers a Helm or ArgoCD sync, so no Job runs on its own either. Something outside has to act. There are three ways, in increasing order of how much you give up.
+
+**1. `bootstrap.rerun` — from git.** Change it to any new value and commit:
+
+```yaml
+bootstrap:
+  rerun: "2026-09-09 node reboot"
+```
+
+The value is mixed into the pod annotations, so it changes the pod-template hash, so the Job gets a new name and runs. Step 2 of the script unseals every replica from the keys in the init Secret. After `revokeRootToken` has already run, the rerun unseals, reports that there is nothing left to configure, and exits 0 — it does not fail the sync.
+
+**2. By hand — from a shell.** Immediate, no commit, and the only option that works once the init Secret is gone. Feed `<threshold>` keys to every sealed replica:
+
+```sh
+for pod in $(kubectl -n openbao get pods \
+             -l app.kubernetes.io/name=openbao,component=server \
+             -o jsonpath='{.items[*].metadata.name}'); do
+  for key in "$KEY1" "$KEY2" "$KEY3"; do
+    kubectl -n openbao exec "$pod" -c openbao -- \
+      bao operator unseal -tls-skip-verify "$key"
+  done
+done
+```
+
+`-tls-skip-verify` is safe here and only here: the CLI is talking to its own
+process inside the pod, so there is no network hop to authenticate. Unsealing an
+already-unsealed node is a no-op, so the loop is safe to re-run. Take the keys
+from a shell variable rather than typing them inline — as arguments they are
+visible in the pod's process list and in your shell history.
+
+**3. Auto-unseal.** The actual fix. Everything above is a human noticing that OpenBao is down.
+
+### The constraint under all of this
+
+Option 1 reads the unseal keys from the `<release>-init-keys` Secret, and option 2 needs you to hold them. The install instructions tell you to take those keys off the cluster and delete that Secret, and you should — but that is exactly the same thing as deciding that **nothing in the cluster can unseal it**, and that a restart is a page for a human with the keys.
+
+That trade is the whole argument for auto-unseal, and it is not avoidable by making the bootstrap cleverer. Any process that can unseal unattended can be made to unseal by an attacker who controls it; the only question is whether the thing holding that power is a Secret in this namespace or a KMS somewhere else. Leaving the keys in the namespace so a Job can use them means a `get secret` in that namespace is equivalent to the master key.
+
 ## Verification status
 
 Rendered and validated, **not deployed** — the homelab cluster has neither Azure

@@ -18,6 +18,12 @@ bootstrap:
   # Production leaves this at its default of true.
   revokeRootToken: false
 
+  # A scratch cluster gets restarted a lot, and under Shamir every restart
+  # seals it. Bump this to any new value to rename the bootstrap Job, which
+  # re-runs it, which unseals every replica from the init-keys Secret. Keeping
+  # root above means the re-run also reconfigures rather than exiting early.
+  rerun: ""
+
 openbao:
   server:
     # The second half of the reveal gate.

@@ -1,0 +1,35 @@
+{{- if and .Values.bootstrap.kubernetesAuth.enabled .Values.bootstrap.kubernetesAuth.rbac.create }}
+{{- $fullname := include "obp.baoFullname" . }}
+{{- $ns := include "obp.namespace" . }}
+# The kubernetes auth method does not verify a service account token by
+# checking its signature — it asks the API server whether the token is still
+# valid, by POSTing a TokenReview on every single login. OpenBao makes that
+# call as ITSELF, using the server pod's own ServiceAccount token, so that
+# ServiceAccount is what needs the permission. Without this binding every
+# login fails with a 403 from the API server, which surfaces to the client as
+# a permission denied from OpenBao and reads like a policy problem.
+#
+# system:auth-delegator is the built-in ClusterRole for exactly this: `create`
+# on tokenreviews and subjectaccessreviews, nothing else. It is still
+# cluster-scoped, and a ClusterRoleBinding is a more privileged object than
+# anything else this chart creates — which is the real cost of this auth
+# method over JWT, where OpenBao verified the signature itself and needed no
+# cluster RBAC at all. That trade buys immediate revocation: delete the
+# ServiceAccount and the next login fails, instead of the token staying good
+# to OpenBao until it expires.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ printf "%s-%s-auth-delegator" $ns $fullname | trunc 63 | trimSuffix "-" }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kubernetes-auth
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "obp.baoServiceAccountName" . }}
+    namespace: {{ $ns }}
+{{- end }}

@@ -53,7 +53,11 @@ There are 16, and [docs/VALUES.md](docs/VALUES.md) says what each one does and h
 helm upgrade --install openbao openbao/ -n openbao \
   -f my-values.yaml
 
-kubectl -n openbao logs -f job/openbao-bootstrap-1 -c bootstrap   # Watch the bootstrap
+# Watch the bootstrap. The Job name carries a hash of its pod spec, so take the
+# newest one — `helm install` prints the exact name too.
+kubectl -n openbao logs -f -c bootstrap "$(kubectl -n openbao get pod \
+  -l app.kubernetes.io/component=bootstrap \
+  --sort-by=.metadata.creationTimestamp -o name | tail -1)"
 kubectl -n openbao get secret openbao-init-keys -o yaml           # Store the keys offline
 kubectl -n openbao delete secret openbao-init-keys                # Then destroy them
 ```
@@ -68,6 +72,27 @@ Overlays in `openbao/examples/` layer on top, `values-openshift.yaml` last, sinc
 ```
 
 `global.openshift` is the only platform switch.
+
+### GitOps (ArgoCD, Flux)
+
+The bootstrap and restore Jobs are named `<release>-bootstrap-<hash>`, where the hash is of the rendered pod template.
+A Job's `spec.template` is immutable, so a changed Job has to be a *new* Job — re-applying the old name fails with `field is immutable` and takes the whole sync down with it.
+Hashing is the default (`jobNameSuffix: content`) and is the only setting that works under a controller, because ArgoCD and Flux render with `helm template`, which pins `.Release.Revision` to `1` forever.
+Set `jobNameSuffix: revision` only under plain `helm upgrade`, and only if you want the Job to re-run on every upgrade whether or not anything changed.
+
+Two consequences worth knowing:
+
+- The name changes when the Job's spec changes, so the previous Job leaves the rendered manifest set and an auto-pruning ArgoCD Application deletes it — along with its logs.
+  Ship the bootstrap log somewhere before that, or turn pruning off for the Application.
+- Upgrading a release installed before this change leaves a stale `<release>-bootstrap-1` behind.
+  It is inert, but delete it once, by hand, or ArgoCD reports it as extraneous forever.
+
+Leave `bootstrap.hook.enabled: false` under GitOps.
+Helm hook Jobs are invisible to drift detection and their logs are deleted on the next release.
+
+To make the bootstrap run again when nothing else about it changed — which under Shamir is how you unseal a cluster that restarted — change `bootstrap.rerun` to any new value and commit.
+It is mixed into the pod annotations, so it feeds the hash, and a new hash is a new Job.
+See [docs/SEAL.md](docs/SEAL.md#unsealing-a-restarted-cluster).
 `false`, the default, pins the uid and `fsGroup` that vanilla Kubernetes does not assign.
 `true` leaves them to the SCC.
 It is a Helm global, so setting it once at the top of your own umbrella reaches every layer, including the vendored subchart.

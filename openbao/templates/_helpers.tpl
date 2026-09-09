@@ -203,3 +203,72 @@ securityContext:
   fsGroup: {{ .gid }}
   {{- end }}
 {{- end -}}
+
+{{/*
+Job name suffix.
+
+A Job's `spec.template` is IMMUTABLE. Re-applying a Job whose pod spec changed
+does not roll it — the API server rejects the patch with
+
+  Job.batch "<name>" is invalid: spec.template: Invalid value: ...
+  field is immutable
+
+and, under a GitOps controller, the whole sync fails with it. A changed Job has
+to be a NEW Job, so the suffix on the name is what has to change.
+
+  content   sha256 of the rendered pod template, truncated. The name changes
+            exactly when the spec changes and is byte-identical for identical
+            input, so the same commit renders the same Job name however often
+            it is re-applied. This is the only mode that works under ArgoCD or
+            Flux, and it is the default.
+
+  revision  `.Release.Revision`, the chart's original behaviour: a new Job on
+            every `helm upgrade`, even when nothing about it changed. It is
+            wrong under GitOps because ArgoCD and Flux render with
+            `helm template`, which hardcodes Revision to 1 — so the name freezes
+            at `-1` and every sync after the first tries to patch that Job.
+            Plain `helm upgrade` only.
+
+Usage: {{ include "obp.jobNameSuffix" (dict "root" $ "content" $podTemplate) }}
+*/}}
+{{- define "obp.jobNameSuffix" -}}
+{{- $mode := .root.Values.jobNameSuffix | default "content" -}}
+{{- if eq $mode "content" -}}
+{{- .content | sha256sum | trunc 10 -}}
+{{- else if eq $mode "revision" -}}
+{{- .root.Release.Revision -}}
+{{- else -}}
+{{- fail (printf "openbao-platform: jobNameSuffix must be \"content\" or \"revision\", got %q." $mode) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Names of the two one-shot Jobs. Defined here rather than inline so that
+NOTES.txt prints the same name the Job is actually created with.
+*/}}
+{{- define "obp.bootstrapJobName" -}}
+{{- $suffix := include "obp.jobNameSuffix" (dict "root" . "content" (include "obp.bootstrapPodTemplate" .)) -}}
+{{- printf "%s-bootstrap-%s" (include "obp.baoFullname" .) $suffix | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "obp.restoreJobName" -}}
+{{- $suffix := include "obp.jobNameSuffix" (dict "root" . "content" (include "obp.restorePodTemplate" .)) -}}
+{{- printf "%s-restore-%s" (include "obp.baoFullname" .) $suffix | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
+The OpenBao server's ServiceAccount, reproducing `openbao.serviceAccount.name`
+from the subchart. Needed because the kubernetes auth method reviews tokens
+with the server's own identity, so that identity is what has to hold
+system:auth-delegator.
+*/}}
+{{- define "obp.baoServiceAccountName" -}}
+{{- $bao := index .Values "openbao" | default dict -}}
+{{- $server := $bao.server | default dict -}}
+{{- $sa := $server.serviceAccount | default dict -}}
+{{- if eq ($sa.create | toString) "false" -}}
+{{- $sa.name | default "default" -}}
+{{- else -}}
+{{- $sa.name | default (include "obp.baoFullname" .) -}}
+{{- end -}}
+{{- end -}}

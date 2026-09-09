@@ -111,7 +111,7 @@ By design, almost nothing leaves the cluster:
 
 | Path | Destination | Notes |
 |---|---|---|
-| Kubernetes JWT auth | `kubernetes.default.svc` | in-cluster only; the provider derives the URL from env |
+| Kubernetes auth (TokenReview) | `kubernetes.default.svc` | in-cluster only, on every login; reviewed with the pod's own SA token and CA |
 | raft join / forwarding | pod DNS | in-cluster |
 | snapshot upload | your S3 | in-cluster if S3 is in-cluster |
 | audit shipping | your log aggregator | in-cluster |

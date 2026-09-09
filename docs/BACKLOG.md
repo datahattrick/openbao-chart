@@ -48,8 +48,10 @@ A `VMRule` with five rules is the highest value-per-line work remaining.
 ### 2. Shamir clusters need a human after any restart
 Under Shamir there is no automatic unseal. A node reboot, an eviction or a
 `kubectl delete pod` to pick up config leaves the cluster sealed until someone
-intervenes — the bootstrap Job only runs on `helm upgrade`.
-Unsealing by hand is a mitigation, not a fix.
+intervenes — and no Kubernetes event triggers a Helm or ArgoCD sync, so no Job
+runs on its own either. `bootstrap.rerun` makes the re-run reachable from git
+and unsealing by hand from a shell always works, but both are mitigations, not
+a fix: each one is a human noticing that OpenBao is down.
 **Auto-unseal is the fix** (`values-azure.yaml` / `values-transit.yaml`).
 Until then, treat any restart of a Shamir cluster as a planned operation.
 
@@ -106,10 +108,14 @@ Migrating an existing initialised cluster to a seal is a real procedure
 (`seal`/`disabled` stanza pairs, `operator unseal -migrate`) and none of it is
 written down here.
 
-### 6. Bootstrap Jobs accumulate
-One per release revision, kept on purpose so their logs remain the record of
-what was configured and when — but unbounded. Either set
-`bootstrap.ttlSecondsAfterFinished` or prune periodically.
+### 6. Bootstrap Job retention is wrong in both directions
+Under plain Helm they accumulate: one per distinct pod spec, kept on purpose so
+their logs remain the record of what was configured and when, but unbounded.
+Set `bootstrap.ttlSecondsAfterFinished` or prune periodically.
+Under an auto-pruning ArgoCD Application the opposite happens — a changed hash
+takes the previous Job out of the manifest set and Argo deletes it, logs and
+all, which is the one copy of what the last bootstrap did. Neither default is
+right for both. Shipping the log off-cluster would settle it.
 
 ### 7. Bootstrap pre-flight records pollute the audit stream
 Every upgrade POSTs a `bootstrap-preflight` record to the real audit endpoint,
@@ -125,3 +131,11 @@ download time. Make it a value.
 `openbao-transit-unseal` (the token) and `openbao-transit-ca` must exist before
 install, and neither is created nor validated. Either add a pre-flight check or
 document them alongside the values.
+
+### 10. The bootstrap ConfigMap is not part of the Job's name hash
+`jobNameSuffix: content` hashes the Job's **pod template**, which references the
+bootstrap ConfigMap by name and does not contain it. So editing `bootstrap.sh`
+alone changes what the Job would do without changing the Job's name — the Job
+is not recreated, and the edit sits there unapplied until something else moves
+the hash. Mixing a checksum of the ConfigMap into the pod annotations, the
+usual Helm pattern, would close it. `bootstrap.rerun` is the manual workaround.

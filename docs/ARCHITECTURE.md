@@ -175,9 +175,9 @@ sequenceDiagram
 
     J->>B: raft autopilot config
     J->>B: policy write raft-snapshot, opentofu
-    J->>B: auth enable jwt @ kubernetes/
-    J->>B: auth config (provider_config: kubernetes)
-    J->>B: role bao-snapshot (bound aud + subject)
+    J->>B: auth enable kubernetes @ kubernetes/
+    J->>B: auth config (kubernetes_host)
+    J->>B: role bao-snapshot (bound SA name + namespace + audience)
     J->>B: list-peers / audit list / auth list
 
     J->>B: token revoke -self
