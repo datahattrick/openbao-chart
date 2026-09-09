@@ -23,6 +23,12 @@ deployment:
 # reads its own key, so both are set; the render fails if only one is.
 priorityClassName: system-cluster-critical
 
+# Leave this at `content` under ArgoCD or Flux. They render with `helm
+# template`, which pins .Release.Revision to 1 forever, so the `revision` mode
+# would freeze the bootstrap Job's name and every sync after the first would
+# fail trying to patch its immutable pod spec.
+jobNameSuffix: content
+
 namespace:
   # Either let this chart own the namespace (and do NOT pass --create-namespace),
   # or create it yourself with Pod Security labels. Helm's --create-namespace
@@ -139,6 +145,13 @@ bootstrap:
     # if a seal is configured and this is not set.
     autoUnseal: false
 
+  # Change to any new value to make the bootstrap run again when nothing else
+  # about it changed. Under Shamir that is how a cluster sealed by a pod
+  # restart gets unsealed from git — it needs the init-keys Secret to still
+  # hold the keys, so it stops working once you have taken them off-cluster.
+  # Layer an auto-unseal overlay and none of this applies.
+  rerun: ""
+
   keyOutput:
     # Left off: while on, anyone who can exec into an OpenBao pod can read the
     # unseal keys. Extract with `kubectl get secret` instead, store the keys
@@ -153,7 +166,32 @@ bootstrap:
   kubernetesAuth:
     enabled: true
     path: kubernetes
+    # The API server OpenBao POSTs a TokenReview to on EVERY login, not only
+    # during bootstrap. If it is unreachable the snapshot agent cannot
+    # authenticate. Left unset, kubernetes_ca_cert and token_reviewer_jwt fall
+    # back to the pod's own ca.crt and ServiceAccount token — no Secret to
+    # manage, and it works in an airgap.
+    host: https://kubernetes.default.svc
+    # Keeps the projected token from being replayable against the Kubernetes
+    # API. KEEP IN SYNC with snapshotAgent.auth.audience.
     audience: openbao
+    # serviceaccount_uid means the identity does not transfer if the
+    # ServiceAccount is deleted and recreated under the same name. Switch to
+    # serviceaccount_name only if you would rather read <ns>/<name> than a uuid
+    # in the audit trail, accepting that.
+    aliasNameSource: serviceaccount_uid
+    rbac:
+      # Binds system:auth-delegator to the OpenBao server ServiceAccount.
+      # Without that binding the API server answers 403 to every TokenReview
+      # and NO login succeeds — the snapshot agent included.
+      #
+      # Set false when whoever installs this chart cannot write cluster-scoped
+      # RBAC. That is common when the chart is a dependency of an umbrella
+      # deployed by a namespace-scoped account, and it is the norm for an
+      # OpenShift project admin. Nothing fails at render: the install notes
+      # print the manifest to hand a cluster admin, and logins 403 until they
+      # apply it. See docs/AUTH.md.
+      create: true
 
   snapshot:
     enabled: true
