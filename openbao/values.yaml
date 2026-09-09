@@ -24,6 +24,18 @@ global:
 # Only change if your kubelet uses a non-default --cluster-domain.
 clusterDomain: cluster.local
 
+# How the one-shot Job names (bootstrap, restore) are suffixed. A Job's
+# spec.template is immutable, so a changed Job must be a NEW Job or the apply
+# fails with "field is immutable" and takes the whole sync with it.
+#
+#   content   suffix is a hash of the rendered pod template. The name changes
+#             exactly when the spec changes and is stable across re-renders of
+#             the same input. REQUIRED under ArgoCD/Flux, which render with
+#             `helm template` — that pins .Release.Revision to 1 forever.
+#   revision  suffix is .Release.Revision, so every `helm upgrade` re-runs the
+#             Job even when nothing changed. Plain Helm only.
+jobNameSuffix: content
+
 # PriorityClass for every workload this chart creates; per-component overrides
 # live under bootstrap/auditProxy/snapshotAgent/restore. The OpenBao
 # StatefulSet reads openbao.server.priorityClassName instead, and the render
@@ -238,6 +250,25 @@ bootstrap:
   affinity: {}
   annotations: {}
   podAnnotations: {}
+
+  # Change this to ANY new value to force the bootstrap Job to run again when
+  # nothing else about it has changed. It is mixed into the pod annotations, so
+  # it feeds the pod-template hash that names the Job (see jobNameSuffix), and a
+  # new name is a new Job.
+  #
+  # The reason this exists: under Shamir, any pod restart seals the node, and
+  # nothing in the cluster unseals it again. Re-running the bootstrap does —
+  # step 2 unseals every replica from the keys in the init Secret, and after
+  # `revokeRootToken` has run it unseals, reports why there is nothing left to
+  # configure, and exits 0. So bumping this and committing is a GitOps-native
+  # unseal. A date or a ticket id reads well in `kubectl describe job`.
+  #
+  # It only works while the init-keys Secret still holds the unseal keys. Once
+  # you have taken them off-cluster and deleted it — which the install
+  # instructions tell you to do — nothing in-cluster can unseal, by design, and
+  # you want scripts/unseal.sh with UNSEAL_KEYS set. Auto-unseal is the real
+  # fix; see docs/SEAL.md.
+  rerun: ""
   # Overrides the top-level priorityClassName.
   priorityClassName: ""
 

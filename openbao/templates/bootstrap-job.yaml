@@ -1,4 +1,10 @@
-{{- if .Values.bootstrap.enabled }}
+{{/*
+Pod template for the bootstrap Job, in its own define so it can be rendered
+twice: once to hash (giving the Job a name that changes exactly when its spec
+changes) and once to emit. NOTES.txt renders it a third time to print the Job
+name it should tell you to tail.
+*/}}
+{{- define "obp.bootstrapPodTemplate" -}}
 {{- $fullname := include "obp.baoFullname" . }}
 {{- $ns := include "obp.namespace" . }}
 {{- $bao := index .Values "openbao" | default dict }}
@@ -10,44 +16,20 @@
 {{- $tag := $bi.tag | default ($img.tag | default (trimPrefix "v" .Chart.AppVersion)) }}
 {{- $sa := .Values.bootstrap.serviceAccount.name | default (printf "%s-bootstrap" $fullname) }}
 {{- $ki := .Values.bootstrap.kubectlImage }}
-apiVersion: batch/v1
-kind: Job
-metadata:
-  # The name carries the revision so that a `helm upgrade` produces a NEW Job
-  # rather than trying to patch an immutable one (Job podspecs cannot be
-  # changed in place, which is the usual cause of "field is immutable" on
-  # upgrade). Old Jobs are left behind on purpose: their logs are the record of
-  # what was configured and when.
-  name: {{ printf "%s-bootstrap-%d" $fullname .Release.Revision | trunc 63 | trimSuffix "-" }}
-  namespace: {{ $ns }}
-  labels:
-    {{- include "obp.labels" . | nindent 4 }}
-    app.kubernetes.io/component: bootstrap
-  annotations:
-    {{- with .Values.bootstrap.annotations }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
-    {{- if .Values.bootstrap.hook.enabled }}
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": {{ .Values.bootstrap.hook.weight | quote }}
-    "helm.sh/hook-delete-policy": {{ .Values.bootstrap.hook.deletePolicy }}
-    {{- end }}
-spec:
-  # One Pod. This is what "only runs on one node" means structurally: there is
-  # no leader election to get wrong and no DaemonSet racing itself.
-  completions: 1
-  parallelism: 1
-  backoffLimit: {{ .Values.bootstrap.backoffLimit }}
-  activeDeadlineSeconds: {{ .Values.bootstrap.activeDeadlineSeconds }}
-  {{- with .Values.bootstrap.ttlSecondsAfterFinished }}
-  ttlSecondsAfterFinished: {{ . }}
-  {{- end }}
   template:
     metadata:
       labels:
         {{- include "obp.labels" . | nindent 8 }}
         app.kubernetes.io/component: bootstrap
-      {{- with .Values.bootstrap.podAnnotations }}
+      {{- $ann := .Values.bootstrap.podAnnotations | default dict }}
+      {{- if .Values.bootstrap.rerun }}
+      {{- /* Feeds the pod-template hash, so changing it renames the Job and */}}
+      {{- /* therefore re-runs it. The only in-git way to make the bootstrap */}}
+      {{- /* run again when nothing else about it changed — which is how you */}}
+      {{- /* unseal a restarted cluster under Shamir without a shell. */}}
+      {{- $ann = merge (dict "openbao-platform/rerun" (.Values.bootstrap.rerun | toString)) $ann }}
+      {{- end }}
+      {{- with $ann }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -267,4 +249,44 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- end -}}
+
+{{- if .Values.bootstrap.enabled }}
+{{- $ns := include "obp.namespace" . }}
+{{- $podTemplate := include "obp.bootstrapPodTemplate" . }}
+{{- $jobName := include "obp.bootstrapJobName" . }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # A Job's spec.template is immutable, so a changed bootstrap has to be a
+  # NEW Job rather than a patch of the existing one — the suffix is what makes
+  # that true. It defaults to a hash of the pod template below, which is why
+  # the pod template is rendered into a variable first. Old Jobs are left
+  # behind on purpose: their logs are the record of what was configured and
+  # when. See obp.jobNameSuffix in _helpers.tpl.
+  name: {{ $jobName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bootstrap
+  annotations:
+    {{- with .Values.bootstrap.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if .Values.bootstrap.hook.enabled }}
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": {{ .Values.bootstrap.hook.weight | quote }}
+    "helm.sh/hook-delete-policy": {{ .Values.bootstrap.hook.deletePolicy }}
+    {{- end }}
+spec:
+  # One Pod. This is what "only runs on one node" means structurally: there is
+  # no leader election to get wrong and no DaemonSet racing itself.
+  completions: 1
+  parallelism: 1
+  backoffLimit: {{ .Values.bootstrap.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.bootstrap.activeDeadlineSeconds }}
+  {{- with .Values.bootstrap.ttlSecondsAfterFinished }}
+  ttlSecondsAfterFinished: {{ . }}
+  {{- end }}
+{{ $podTemplate | trimPrefix "\n" }}
 {{- end }}

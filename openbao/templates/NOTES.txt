@@ -25,7 +25,7 @@ NEXT STEPS
   1. Watch the bootstrap Job. It initialises, unseals and configures the
      cluster, and it is the only thing that runs on exactly one node.
 
-       kubectl -n {{ $ns }} logs -f job/{{ printf "%s-bootstrap-%d" $fullname .Release.Revision | trunc 63 | trimSuffix "-" }}
+       kubectl -n {{ $ns }} logs -f job/{{ include "obp.bootstrapJobName" . }}
 {{ if eq (include "obp.revealKeys" .) "true" }}
   !! KEY REVEAL IS ON. deployment.environment=development and the server log
   !! level is {{ include "obp.logLevel" . }}, so the unseal keys and root token WILL be

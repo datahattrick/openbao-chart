@@ -110,7 +110,9 @@ helm upgrade openbao openbao/ -n openbao \
   --set restore.mode=same-cluster \
   --set restore.tokenSecret.name=openbao-restore-token
 
-kubectl -n openbao logs -f job/openbao-restore-<revision>
+kubectl -n openbao logs -f "$(kubectl -n openbao get pod \
+  -l app.kubernetes.io/component=restore \
+  --sort-by=.metadata.creationTimestamp -o name | tail -1)"
 ```
 
 `restore.tokenSecret` is required because the bootstrap revokes the root token.
