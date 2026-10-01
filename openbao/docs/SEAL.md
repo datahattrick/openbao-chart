@@ -1,0 +1,618 @@
+# Auto-unseal
+
+Two environments, two mechanisms — and only one of them needs a plugin.
+
+| Environment | Seal | Plugin needed? | Overlay |
+|---|---|---|---|
+| Azure | `azurekeyvault` | **yes**, from v2.7.0 | `values-azure.yaml`, or `values-azure-oci.yaml` |
+| Other | `transit` (another OpenBao) | no — stays built-in | `values-transit.yaml` |
+
+## What changes in v2.7.0
+
+The built-in `alicloudkms`, `awskms`, **`azurekeyvault`**, `gcpckms`, `ocikms`
+and `pkcs11` seals are **removed from the OpenBao binary in v2.7.0** and remain
+available as external plugins only. `transit` is **not** on that list.
+
+A plugin **shadows a built-in of the same name and takes priority**. So register
+the plugin now, while still on 2.6.x, and the 2.7.0 upgrade becomes a no-op
+instead of a flag day. That is the migration path this chart takes.
+
+```mermaid
+flowchart LR
+    subgraph now["OpenBao 2.6.x — today"]
+        b1["built-in azurekeyvault"]
+        p1["plugin azurekeyvault"]
+        p1 -->|shadows, takes priority| b1
+    end
+    subgraph then["OpenBao 2.7.0"]
+        b2["built-in: REMOVED"]
+        p2["plugin azurekeyvault"]
+    end
+    now -->|"upgrade — nothing to change"| then
+    style b2 fill:#fee,stroke:#c44
+    style p1 fill:#efe,stroke:#4a4
+    style p2 fill:#efe,stroke:#4a4
+```
+
+## Getting the plugin into the pod
+
+Two delivery paths, both airgap-capable. `seal.plugin.source` picks one.
+
+```mermaid
+flowchart TB
+    art[("Artifactory")]
+
+    subgraph pre["source: preloaded — the default"]
+        direction TB
+        p1["initContainer: curl tarball<br/><i>auth: the pod's ServiceAccount</i>"] --> p2["sha256sum -c<br/><i>refuses to install on mismatch</i>"] --> p3["install -m 0755 into<br/>plugin_directory (emptyDir)"]
+    end
+
+    subgraph oci["source: oci"]
+        direction TB
+        o0["config.json<br/><i>a Secret, or minted by registry-login</i>"] --> o1["OpenBao pulls the OCI image itself"] --> o2["extracts binary"] --> o3["verifies sha256sum"]
+    end
+
+    art -->|"generic repo"| pre
+    art -->|"Docker repo"| oci
+    pre --> pd[("plugin_directory<br/>/openbao/plugins")]
+    oci --> pd
+    pd --> bao["OpenBao verifies sha256sum again,<br/>then loads the seal"]
+
+    style pre fill:#efe,stroke:#4a4
+    style oci fill:#eef,stroke:#88a
+```
+
+**`sha256sum` is mandatory either way** — OpenBao verifies the binary against it
+on load. That is precisely what makes pulling from a mirror or Artifactory safe,
+and why the chart refuses to render without it.
+
+### Why `preloaded` is the default
+
+`oci` looks like the smaller option — no initContainer — but every piece of
+Artifactory plumbing then has to live *inside the server process*, where OpenBao
+gives you almost no control over it:
+
+| | `preloaded` | `oci` |
+|---|---|---|
+| Who talks to Artifactory | curl, in an initContainer | the OpenBao server process |
+| Credentials | any of three methods, incl. the pod's ServiceAccount | a `dockerconfigjson` file found by a fixed search order — an initContainer can [mint one](#mode-serviceaccount--docker-login-from-the-pods-own-identity) from the pod's ServiceAccount |
+| Missing credentials | curl fails loudly | pulls **anonymously**, 401 looks like a wrong password |
+| Private CA | `CURL_CA_BUNDLE`, scoped to curl | must enter OpenBao's own trust store via `SSL_CERT_DIR` |
+| Failure surface | one container, one log line | server startup, mixed in with the seal |
+
+The decisive one is the CA. On `oci` the registry's CA has to be trusted by
+OpenBao itself, which means editing `SSL_CERT_DIR` — the same variable the http
+audit device depends on, and one that *replaces* Go's defaults rather than
+extending them. On `preloaded` OpenBao never talks to Artifactory at all, so its
+trust store is left alone.
+
+Reach for `oci` only if you cannot run an initContainer, or if the registry is
+the only copy of the plugin you have. The credential row closes —
+`registryAuth.mode: serviceAccount` mints the file from the pod's own
+ServiceAccount, with nothing long-lived stored, and it still needs an
+initContainer to do it. The CA row does not: on `oci` the pull happens inside
+OpenBao no matter who wrote the credential.
+
+### The two binary names
+
+Same binary, same bytes, same checksum — packaged under different names:
+
+| Source | Name |
+|---|---|
+| OCI image `ghcr.io/openbao/openbao-plugin-kms-azure:v0.1.0` | `openbao-plugin-kms-azure` |
+| Release tarball `openbao-plugin-kms-azure_linux_amd64_v1.tar.gz` | `openbao-plugin-kms-azure_linux_amd64_v1` |
+
+### The image reference is split in two
+
+`image` takes the repository **without a tag**; the tag goes in `version`.
+OpenBao assembles the reference itself as `image` + `:` + `version`, so leaving
+the tag on `image` yields a second colon and the server refuses to start:
+
+```
+image and version do not form a valid image reference
+```
+
+```hcl
+plugin "kms" "azurekeyvault" {
+  image       = "artifactory.example.com/openbao/openbao-plugin-kms-azure"
+  version     = "v0.1.0"
+  binary_name = "openbao-plugin-kms-azure"
+  sha256sum   = "e46a6d13…"
+}
+```
+
+A registry **port** — `artifactory.example.com:5000/openbao/…` — is fine; only a
+trailing `:tag` is not. The chart checks the last path segment only, and
+`version` is required in both delivery modes, not just `oci`.
+
+### `plugin_auto_download` defaults to false
+
+So does `plugin_auto_register`. With `source: oci` the plugin directory is an
+empty `emptyDir` and nothing else populates it, so without
+`seal.autoDownload: true` the server never contacts the registry and the seal
+fails as "plugin not found" — the config file looks complete either way. The
+chart fails the render on that combination.
+
+`autoRegister` is a separate matter: a `kms` plugin is usable at startup without
+appearing in the plugin catalog, so it does not need registering. It is only
+what makes `plugin.args` and `plugin.env` take effect, and the chart fails the
+render if either is set without it.
+
+`downloadBehavior` renders `plugin_download_behavior`, whose accepted values are
+`fail` and `warn`.
+
+### Authenticating with the pod's ServiceAccount
+
+`fetch.auth.method: serviceAccount` is the option with nothing long-lived to
+store. Kubernetes projects a short-lived token into the pod, the initContainer
+trades it for an Artifactory access token, and both are gone when the container
+exits.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as kubelet
+    participant I as fetch-seal-plugin (initContainer)
+    participant A as Artifactory
+    participant P as plugin_directory
+
+    K->>I: project SA token<br/>aud: <fetch.auth.serviceAccount.audience><br/>exp: 3600s
+    I->>A: POST /access/api/v1/oidc/token<br/>grant_type=token-exchange<br/>subject_token=<SA JWT><br/>provider_name=<provider>
+    A->>A: match identity mapping<br/>sub = system:serviceaccount:ns:sa
+    A-->>I: access_token
+    I->>A: GET tarball<br/>Authorization: Bearer <access_token>
+    A-->>I: tarball
+    I->>I: sha256sum -c<br/>refuses to install on mismatch
+    I->>P: install -m 0755
+```
+
+The Artifactory side is an OIDC provider whose identity mapping binds
+`sub = system:serviceaccount:<namespace>:<serviceaccount>` and grants read on
+the generic repo. Three things have to line up, and the chart checks all three:
+
+- `fetch.auth.serviceAccount.audience` must equal the audience the provider
+  accepts. It is **not** the auto-mounted token's audience — that one is the API
+  server's, which Artifactory will not take, and it is why the chart projects a
+  token of its own rather than reusing `/var/run/secrets/kubernetes.io/…`.
+- `openbao.server.volumes` must carry the matching `projected` volume, since the
+  subchart does not template that list.
+- `tokenUrl` and `providerName` go together. `providerName` without `tokenUrl`
+  would send the raw Kubernetes token as the Bearer, which Artifactory rejects.
+
+`expirationSeconds` has a **600 second floor** in Kubernetes, which is applied
+silently — set anything lower and the pod gets 600 anyway, so the chart fails
+the render instead.
+
+Two details in the script worth keeping if you adapt it:
+
+- **Neither token goes through `argv`.** The exchange body is passed as
+  `-d @file` and the download header through a `curl -K` config file, so
+  nothing sensitive appears in `ps`. `-H "Authorization: Bearer $TOKEN"` would.
+- **An empty `access_token` is checked explicitly.** An identity mapping that
+  matches nothing still answers `200`, so `curl -f` does not catch it and the
+  download would silently proceed unauthenticated.
+
+The other two methods: `bearerSecret` reads a long-lived token from a Secret
+into `ARTIFACTORY_TOKEN`, and `none` downloads anonymously.
+
+### A registry behind a private CA
+
+`seal.plugin.registryCA` names the bundle for both sources, but they consume it
+very differently.
+
+On **`preloaded`** it becomes `CURL_CA_BUNDLE` on the fetch container — scoped
+to curl, and OpenBao's own trust store is untouched. That is all it takes.
+
+On **`oci`** the *server process* performs the pull and the plugin stanza has no
+CA option, so the CA has to enter OpenBao's trust store. Missing, it surfaces as
+`x509: certificate signed by unknown authority` from the plugin download rather
+than from the seal. The rest of this section is about that case. Three things have to agree, and because
+Helm cannot template subchart values none of them follows from the others — the
+chart fails the render if any is missing:
+
+```yaml
+openbao:
+  server:
+    seal:
+      plugin:
+        registryCA:
+          configMap: artifactory-ca-bundle
+          key: ca-bundle.crt
+          mountPath: /openbao/tls/registry
+
+    volumes:
+      - name: registry-ca
+        configMap: { name: artifactory-ca-bundle }
+    volumeMounts:
+      - { name: registry-ca, mountPath: /openbao/tls/registry, readOnly: true }
+
+    extraEnvironmentVars:
+      SSL_CERT_DIR: /openbao/tls/internal:/openbao/tls/registry
+```
+
+Give it **its own directory**: `SSL_CERT_DIR` reads a directory whole, and the
+backend CA's mount is a Secret that cannot be merged with a ConfigMap.
+
+> **`SSL_CERT_DIR` replaces, it does not extend.** Go reads only the directories
+> named there — the default `/etc/ssl/certs` and friends drop out — so the list
+> is colon-separated and every directory you need must appear in it. Losing
+> `/openbao/tls/internal` while adding the registry breaks the http audit
+> device, which takes no CA option either, and a failing audit device stops
+> OpenBao serving requests. The chart checks for that entry too.
+>
+> Public roots are unaffected: they come from a default bundle **file**
+> (`/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem` on the UBI image) that
+> `SSL_CERT_DIR` does not touch. `SSL_CERT_FILE` *would* replace it — never set
+> that one.
+
+A ConfigMap volume presents each key as a symlink into `..data/`. Go follows
+those (it only skips symlinks pointing within the same directory), so the bundle
+is read normally.
+
+### Registry credentials
+
+An **imagePullSecret does not reach this pull** — the kubelet is not making it.
+The server process reads Docker/Podman config files, in this order:
+
+1. `$HOME/.docker/config.json`
+2. `$DOCKER_CONFIG/config.json`
+3. `$REGISTRY_AUTH_FILE`
+4. `$XDG_RUNTIME_DIR/containers/auth.json`, then `$XDG_CONFIG_HOME/containers/auth.json`
+
+Finding none of them, it pulls **anonymously** rather than failing, so every way
+of getting this wrong looks identical from the outside: a 401 or 403 naming the
+registry, never the missing Secret.
+
+Use `DOCKER_CONFIG`. It is the only entry that wins deterministically — once any
+Docker config is found, the loader reads `config.Load($DOCKER_CONFIG)`, so
+whatever that variable points at is what gets used. `REGISTRY_AUTH_FILE` is
+consulted only when no Docker config was found anywhere.
+
+```yaml
+openbao:
+  server:
+    seal:
+      plugin:
+        registryAuth:
+          mode: secret
+          secretName: artifactory-pull
+          key: .dockerconfigjson
+          mountPath: /openbao/.docker
+
+    volumes:
+      - name: registry-auth
+        secret:
+          secretName: artifactory-pull
+          defaultMode: 0400
+          items:
+            - key: .dockerconfigjson    # `items` is NOT optional — see below
+              path: config.json
+    volumeMounts:
+      - { name: registry-auth, mountPath: /openbao/.docker, readOnly: true }
+
+    extraEnvironmentVars:
+      DOCKER_CONFIG: /openbao/.docker   # the DIRECTORY, not the file
+```
+
+`DOCKER_CONFIG` names the **directory**; pointing it at the file finds nothing.
+The chart checks that too, along with the volume and the volumeMount.
+
+Where that `config.json` comes from is `registryAuth.mode`:
+
+| | `secret` | `serviceAccount` |
+|---|---|---|
+| Who writes the file | you, once | the `registry-login` initContainer, every pod start |
+| Credential | long-lived, until you rotate it | an Artifactory access token minted per pod |
+| At rest in the namespace | yes, in a Secret | nothing |
+| The volume | the Secret, `items` renaming the key | an `emptyDir` |
+| Also needs | — | an Artifactory OIDC provider and identity mapping |
+
+#### `mode: secret`
+
+The Secret is an ordinary `kubernetes.io/dockerconfigjson`, so an existing
+imagePullSecret can be reused as-is:
+
+```sh
+kubectl create secret docker-registry artifactory-pull -n openbao \
+  --docker-server=artifactory.example.com \
+  --docker-username=… --docker-password=…
+```
+
+> **`items` is not optional.** The loader opens `<DOCKER_CONFIG>/config.json` by
+> that exact filename. A Secret mounted plainly produces a file named after its
+> key — `.dockerconfigjson` — which is never found, and not found means
+> anonymous. The rename is what makes the mount work, and the chart fails the
+> render without it.
+
+#### `mode: serviceAccount` — docker login from the pod's own identity
+
+OpenBao cannot fetch a credential; it can only read one. So the exchange the
+`preloaded` path performs *during* the download happens one step earlier here,
+in an initContainer, and its result is left on disk for the server to find.
+Worked overlay: [examples/values-azure-oci.yaml](../openbao/examples/values-azure-oci.yaml).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as kubelet
+    participant I as registry-login (initContainer)
+    participant A as Artifactory
+    participant D as emptyDir at DOCKER_CONFIG
+    participant B as openbao (server)
+
+    K->>I: project SA token<br/>aud: <registryAuth.serviceAccount.audience><br/>exp: 3600s
+    I->>A: POST /access/api/v1/oidc/token<br/>grant_type=token-exchange<br/>subject_token=<SA JWT>
+    A->>A: match identity mapping<br/>sub = system:serviceaccount:ns:sa<br/>read on the DOCKER repo
+    A-->>I: access_token
+    I->>D: write config.json<br/>auths[registry].auth = base64 of "username:access_token"
+    Note over I: exits; both tokens' temp files are removed
+    B->>A: pull plugin image<br/>credential read from DOCKER_CONFIG
+    A-->>B: image → binary → sha256sum verified
+```
+
+```yaml
+openbao:
+  server:
+    seal:
+      plugin:
+        registryAuth:
+          mode: serviceAccount
+          mountPath: /openbao/.docker
+          serviceAccount:
+            audience: artifactory
+            expirationSeconds: 3600
+            tokenMountPath: /var/run/secrets/artifactory
+            tokenUrl: https://artifactory.example.com/access/api/v1/oidc/token
+            providerName: k8s-openbao
+            username: openbao          # must be non-empty — see below
+            registry: ""               # defaults to the host part of `image`
+
+    volumes:
+      - name: registry-auth            # WRITTEN to, so an emptyDir
+        emptyDir: {}
+      - name: artifactory-token
+        projected:
+          sources:
+            - serviceAccountToken: { path: token, audience: artifactory, expirationSeconds: 3600 }
+    volumeMounts:
+      - { name: registry-auth, mountPath: /openbao/.docker, readOnly: true }
+
+    extraEnvironmentVars:
+      DOCKER_CONFIG: /openbao/.docker
+```
+
+The identity mapping is the same shape as the `preloaded` path's, but it must
+grant read on the **Docker** repo rather than the generic one. Everything said
+about the audience there applies unchanged: it is not the auto-mounted token's
+audience, which is why a token is projected with one of its own, and
+`expirationSeconds` has the same silent 600 second floor.
+
+Four things about the file itself are easy to get wrong, and all four fail as an
+identical 401 from the registry, so the chart or the script catches each:
+
+- **The `auth` field is base64 of `user:password` with no trailing newline.**
+  The decoder splits on the first colon, so a newline lands inside the password.
+  The pair is assembled through a file and `tr -d '\n'`, not `printf`
+  arguments — which also keeps the token out of `ps`, exactly as in the fetch
+  script.
+- **The username must be non-empty.** Artifactory takes the identity from the
+  token, so its value rarely matters, but an empty one makes the pair `:<token>`
+  and the request reads as anonymous. The render refuses it.
+- **The registry key must be what the pull looks up** — the host part of
+  `seal.plugin.image`, port included if it has one. That is the default;
+  `registry` overrides it only if the registry redirects elsewhere.
+- **The credential volume is an `emptyDir`.** A Secret or ConfigMap volume is
+  read-only, so the write fails *after* the exchange has already happened. The
+  render checks the volume's type.
+
+The registry's CA is needed **twice** on this path, by two different consumers:
+`CURL_CA_BUNDLE` on the initContainer for the token exchange, and `SSL_CERT_DIR`
+on the server for the pull itself. One ConfigMap, mounted into both.
+
+> **The token is not refreshed.** It is minted at pod start and spent seconds
+> later, when the server downloads the plugin — which is the only time OpenBao
+> pulls. A `bao plugin reload` days afterwards would find an expired credential
+> in `config.json` and fail; restart the pod to mint a new one.
+
+#### Credentials cannot go in the reference
+
+There is no `oci://user:password@registry/repo` form, and no auth field in the
+plugin stanza. `image` is an OCI reference, not a URL: go-containerregistry
+validates the registry as an RFC 3986 **authority** —
+`url.Parse("//" + name)`, then `url.Host` must equal `name` — which both a
+scheme and a `user:pass@` prefix fail, before any pull is attempted.
+
+It would be the wrong place regardless. The server config is rendered into a
+**ConfigMap**, not a Secret, so a password there would be readable by anyone who
+can read ConfigMaps in the namespace — the same reason the transit seal's token
+comes from `extraSecretEnvironmentVars` and never from the config file.
+
+The chart fails the render on both forms and names `registryAuth` instead.
+
+The published `checksums-kms-azure.txt` line refers to the **tarball** name.
+Verified by extracting both and comparing hashes — identical
+(`e46a6d13…`). The chart models this as two values: `binaryName` (OCI /
+installed name) and `archiveBinary` (inside the tarball, used for the checksum
+check). Mixing them up surfaces as "plugin not found" or a checksum mismatch,
+neither of which points at the naming.
+
+Mirror both if you want both paths available:
+
+```sh
+skopeo copy --all \
+  docker://ghcr.io/openbao/openbao-plugin-kms-azure:v0.1.0 \
+  docker://artifactory.example.com/openbao/openbao-plugin-kms-azure:v0.1.0
+
+curl -fLO https://github.com/openbao/openbao-plugins/releases/download/\
+kms-azure-v0.1.0/openbao-plugin-kms-azure_linux_amd64_v1.tar.gz
+```
+
+## Azure Key Vault with Workload Identity
+
+Federated OIDC — no client secret anywhere in the cluster.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as azure-workload-identity webhook
+    participant P as openbao pod
+    participant E as Entra ID
+    participant KV as Key Vault
+
+    Note over P: pod label azure.workload.identity/use: "true"
+    W->>P: inject AZURE_CLIENT_ID, AZURE_TENANT_ID,<br/>AZURE_FEDERATED_TOKEN_FILE, AZURE_AUTHORITY_HOST<br/>+ projected token (aud: api://AzureADTokenExchange)
+    P->>E: exchange federated token<br/>(auth_method = "workload_identity")
+    E->>E: match federated credential<br/>issuer = AKS OIDC issuer<br/>subject = system:serviceaccount:ns:sa
+    E-->>P: access token
+    P->>KV: unwrapKey(unseal key)
+    KV-->>P: unwrapped key → OpenBao unseals
+```
+
+`auth_method = "workload_identity"` selects `WorkloadIdentityCredential`
+explicitly. `default` would also find it, but only after walking a credential
+chain, and it fails less clearly when misconfigured.
+
+Leave `tenantId` and `clientId` **empty** — the webhook injects them, and values
+in the config file take precedence over what it injected.
+
+### Prerequisites outside this chart
+
+1. Key Vault + key, with the managed identity granted **Key Vault Crypto User**
+   (`wrapKey`, `unwrapKey`, `get`).
+2. A **federated credential** on that identity:
+   `issuer` = the AKS cluster's OIDC issuer URL,
+   `subject` = `system:serviceaccount:<namespace>:<serviceaccount>`,
+   `audience` = `api://AzureADTokenExchange`.
+3. The **azure-workload-identity webhook** installed. It only mutates pods
+   carrying the `azure.workload.identity/use: "true"` label — the chart fails
+   the render if that label or the SA's `client-id` annotation is missing,
+   because otherwise the seal fails at startup with an opaque credential error.
+
+## Transit
+
+No plugin needed. The token comes from a Secret via
+`extraSecretEnvironmentVars`, never from the config file — that is a ConfigMap.
+
+On the unsealer:
+
+```sh
+bao secrets enable transit
+bao write -f transit/keys/openbao-unseal
+bao policy write openbao-unseal - <<'POLICY'
+path "transit/encrypt/openbao-unseal" { capabilities = ["update"] }
+path "transit/decrypt/openbao-unseal" { capabilities = ["update"] }
+POLICY
+```
+
+> **Circularity warning.** The unsealer must not depend on this cluster for
+> anything, or a simultaneous restart deadlocks both. Keep it in a separate
+> failure domain, and keep it Shamir- or KMS-sealed itself.
+
+Its CA is its own trust domain — mount it separately, do **not** reuse this
+cluster's backend CA.
+
+## What auto-unseal changes about bootstrap
+
+`bootstrap.init.autoUnseal: true` is **mandatory** with any seal, and the chart
+fails the render if the two disagree in either direction.
+
+```mermaid
+flowchart LR
+    subgraph shamir["Shamir (no seal)"]
+        s1["operator init<br/>-key-shares/-key-threshold"] --> s2["UNSEAL keys"] --> s3["Job unseals every replica"]
+    end
+    subgraph auto["auto-unseal (seal configured)"]
+        a1["operator init<br/>-recovery-shares/-recovery-threshold"] --> a2["RECOVERY keys"] --> a3["cluster unseals itself<br/><i>Job skips unsealing</i>"]
+    end
+    style shamir fill:#eef,stroke:#88a
+    style auto fill:#efe,stroke:#4a4
+```
+
+**Recovery keys do not unseal anything.** They authorise recovery operations —
+root generation, `rekey`. Note those endpoints are disabled by default since
+v2.5.3; see [RESTORE.md](RESTORE.md#minting-a-root-token-break-glass). Store them as carefully as unseal keys, and note the
+harder truth: with auto-unseal, **losing the KMS key is unrecoverable no matter
+what you kept**. Back up the Key Vault key, and see
+[RESTORE.md](RESTORE.md) — a snapshot is still worthless without the means to
+decrypt it.
+
+## Unsealing a restarted cluster
+
+This section is about the Shamir case. With auto-unseal configured, none of it applies — the node unseals itself and nothing has to run.
+
+Under Shamir, **any** pod restart seals the node: a reboot, an eviction, a `kubectl delete pod` to pick up a config change. Nothing in the cluster unseals it again, and no Kubernetes event triggers a Helm or ArgoCD sync, so no Job runs on its own either. Something outside has to act. There are three ways, in increasing order of how much you give up.
+
+**1. `bootstrap.rerun` — from git.** Change it to any new value and commit:
+
+```yaml
+bootstrap:
+  rerun: "2026-09-09 node reboot"
+```
+
+The value is mixed into the pod annotations, so it changes the pod-template hash, so the Job gets a new name and runs. Step 2 of the script unseals every replica from the keys in the init Secret. After `revokeRootToken` has already run, the rerun unseals, reports that there is nothing left to configure, and exits 0 — it does not fail the sync.
+
+**2. By hand — from a shell.** Immediate, no commit, and the only option that works once the init Secret is gone. Feed `<threshold>` keys to every sealed replica:
+
+```sh
+for pod in $(kubectl -n openbao get pods \
+             -l app.kubernetes.io/name=openbao,component=server \
+             -o jsonpath='{.items[*].metadata.name}'); do
+  for key in "$KEY1" "$KEY2" "$KEY3"; do
+    kubectl -n openbao exec "$pod" -c openbao -- \
+      bao operator unseal -tls-skip-verify "$key"
+  done
+done
+```
+
+`-tls-skip-verify` is safe here and only here: the CLI is talking to its own
+process inside the pod, so there is no network hop to authenticate. Unsealing an
+already-unsealed node is a no-op, so the loop is safe to re-run. Take the keys
+from a shell variable rather than typing them inline — as arguments they are
+visible in the pod's process list and in your shell history.
+
+**3. Auto-unseal.** The actual fix. Everything above is a human noticing that OpenBao is down.
+
+### The constraint under all of this
+
+Option 1 reads the unseal keys from the `<release>-init-keys` Secret, and option 2 needs you to hold them. The install instructions tell you to take those keys off the cluster and delete that Secret, and you should — but that is exactly the same thing as deciding that **nothing in the cluster can unseal it**, and that a restart is a page for a human with the keys.
+
+That trade is the whole argument for auto-unseal, and it is not avoidable by making the bootstrap cleverer. Any process that can unseal unattended can be made to unseal by an attacker who controls it; the only question is whether the thing holding that power is a Secret in this namespace or a KMS somewhere else. Leaving the keys in the namespace so a Job can use them means a `get secret` in that namespace is equivalent to the master key.
+
+## Verification status
+
+Rendered and validated, **not deployed** — the homelab cluster has neither Azure
+nor a second OpenBao. What was checked directly:
+
+- all three overlays render; the `seal`, `plugin`, `plugin_directory` stanzas emit
+  correctly, and `plugin_directory` is omitted when no plugin is registered
+- the split `image`/`version` reference, `plugin_auto_download` and
+  `plugin_auto_register` were corrected against the upstream declarative-plugin
+  docs after a live `image and version do not form a valid image reference`
+- the registry-CA and credential wiring render, and every way of getting either
+  half-right fails the render; the trust and credential mechanisms are read from
+  Go's `crypto/x509` and go-containerregistry's `authn` keychain, not tested
+  against a private registry
+- **the fetch script was rendered and then executed** against a stub standing in
+  for Artifactory: the exchange POSTs the RFC 8693 body with the projected
+  token, the download carries the *exchanged* token as its Bearer, the binary
+  installs 0755 under the right name, and all three credential-bearing temp
+  files are removed. A tampered checksum and an exchange answering 200 with no
+  `access_token` both abort before anything is installed. Not tested against a
+  real Artifactory OIDC provider
+- the plugin OCI image and release tarball were both fetched and their binaries
+  hashed — identical bytes, and the published checksum matches
+- the fetch script's download → `sha256sum -c` → `install` logic was executed
+  against the real artifact; a tampered binary is correctly refused
+- **the `registry-login` script was rendered and then executed** in
+  `curlimages/curl:8.11.1` against a stub standing in for Artifactory: the
+  exchange POSTs the projected token, the *exchanged* token is what reaches
+  `config.json`, the base64 pair carries no trailing newline and stays unwrapped
+  for a 515-character token, the file lands 0600 under the registry host taken
+  from `image`, and no credential temp file survives. An exchange answering 200
+  with no `access_token`, and a failing exchange, both abort before anything is
+  written. Not tested against a real Artifactory Docker repo, and the resulting
+  `config.json` was not put in front of go-containerregistry's keychain
+- 54 negative tests against the validation rules, all caught
+
+Not verified without Azure: the federated token exchange and an actual
+wrap/unwrap against Key Vault.

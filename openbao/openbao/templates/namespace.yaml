@@ -1,0 +1,21 @@
+{{- if .Values.namespace.create }}
+# Helm's --create-namespace makes a namespace with no Pod Security labels.
+# OpenBao runs happily under `restricted`, so there is no reason to leave it
+# unlabelled. Do NOT pass --create-namespace when this is enabled.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "obp.namespace" . }}
+  labels:
+    {{- include "obp.labels" . | nindent 4 }}
+    pod-security.kubernetes.io/enforce: {{ .Values.namespace.podSecurity.enforce }}
+    pod-security.kubernetes.io/audit: {{ .Values.namespace.podSecurity.audit }}
+    pod-security.kubernetes.io/warn: {{ .Values.namespace.podSecurity.warn }}
+    {{- with .Values.namespace.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.namespace.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

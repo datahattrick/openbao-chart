@@ -1,0 +1,291 @@
+# Environment: Azure — auto-unseal with Azure Key Vault via Workload Identity.
+#
+#   helm upgrade --install openbao openbao/ -n openbao \
+#     -f openbao/examples/values-prod.yaml \
+#     -f openbao/examples/values-azure.yaml
+#
+# PREREQUISITES OUTSIDE THIS CHART
+#   1. A Key Vault and a key, with the workload's managed identity granted
+#      Key Vault Crypto User (wrapKey/unwrapKey/get) on it.
+#   2. A federated credential on that identity:
+#        issuer  = the AKS cluster's OIDC issuer URL
+#        subject = system:serviceaccount:<namespace>:<serviceaccount name>
+#        audience= api://AzureADTokenExchange
+#   3. The azure-workload-identity webhook installed in the cluster. It is what
+#      injects AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_FEDERATED_TOKEN_FILE /
+#      AZURE_AUTHORITY_HOST, and it only mutates pods carrying the
+#      `azure.workload.identity/use: "true"` label.
+
+bootstrap:
+  init:
+    # Mandatory with any seal. OpenBao issues RECOVERY keys instead of unseal
+    # keys, and the Job must not try to unseal a cluster that unseals itself.
+    # The render fails if this disagrees with the seal.
+    autoUnseal: true
+    # Recovery keys authorise recovery operations (generate-root, rekey). They
+    # do NOT unseal anything. Store them exactly as carefully as unseal keys —
+    # and note that losing the Key Vault key is unrecoverable regardless.
+    keyShares: 5
+    keyThreshold: 3
+
+openbao:
+  server:
+    # The webhook only mutates pods with this label.
+    extraLabels:
+      azure.workload.identity/use: "true"
+
+    serviceAccount:
+      create: true
+      annotations:
+        # The user-assigned managed identity's client ID.
+        azure.workload.identity/client-id: "CHANGEME-00000000-0000-0000-0000-000000000000"
+        # Optional; defaults to the cluster's tenant.
+        # azure.workload.identity/tenant-id: "..."
+
+    seal:
+      type: azurekeyvault
+      directory: /openbao/plugins
+      # fail | warn
+      downloadBehavior: fail
+      # plugin_auto_download. Only governs OCI downloads, which the preloaded
+      # path does not use — leaving it on would grant the server registry
+      # egress it never needs. The render fails if it disagrees with `source`.
+      autoDownload: false
+      # A kms plugin does not need catalog registration; leave it off unless
+      # you set plugin.args or plugin.env, which are ignored without it.
+      autoRegister: false
+
+      azurekeyvault:
+        vaultName: CHANGEME-kv
+        keyName: openbao-unseal
+        # Federated OIDC — no client secret anywhere in the cluster.
+        # tenantId/clientId stay EMPTY: the webhook injects them, and setting
+        # them here would override what it injected.
+        authMethod: workload_identity
+        # environment: AZUREUSGOVERNMENT   # for sovereign clouds
+        # resource: vault.usgovcloudapi.net
+
+      plugin:
+        # Required from OpenBao v2.7.0, harmless before it: a plugin shadows
+        # the built-in of the same name, so registering it now makes the 2.7.0
+        # upgrade a no-op.
+        enabled: true
+        type: kms
+        name: azurekeyvault          # must equal seal.type to shadow the built-in
+
+        # ------------------------------------------------------------------
+        # DELIVERY: the tarball, fetched by an initContainer.
+        # ------------------------------------------------------------------
+        # Artifactory serves the release tarball from a GENERIC repo, the fetch
+        # step authenticates with the pod's own ServiceAccount, and the server
+        # process needs neither registry credentials nor registry egress. The
+        # `oci` source is still supported (see registryCA / registryAuth in
+        # values.yaml) but puts all of that plumbing inside OpenBao itself.
+        source: preloaded
+
+        # Required field of the plugin stanza in BOTH modes, so it is set even
+        # though nothing is pulled by tag here. Keep it in step with sha256sum.
+        version: v0.1.0
+
+        # The installed name, and what OpenBao looks for in `directory`.
+        binaryName: openbao-plugin-kms-azure
+        command: openbao-plugin-kms-azure
+        # Name inside the release tarball, which differs from the above, and
+        # the name the published checksum line refers to. Change the arch
+        # suffix for non-amd64 nodes and take the matching sha256sum line.
+        archiveBinary: openbao-plugin-kms-azure_linux_amd64_v1
+
+        # NOT OPTIONAL. OpenBao verifies the binary against this, which is what
+        # makes pulling from a mirror safe. Upstream value for
+        # kms-azure v0.1.0, linux/amd64 — re-derive it for any other
+        # version or architecture from checksums-kms-azure.txt on the release:
+        #   https://github.com/openbao/openbao-plugins/releases/tag/kms-azure-v0.1.0
+        sha256sum: e46a6d13ab427b594c89e58b002db6bbb6d61557f5de8a599557c76827deef0d
+
+        # Artifactory's private CA. On this path it never enters OpenBao's
+        # trust store — the fetch initContainer passes it to curl as
+        # CURL_CA_BUNDLE, so SSL_CERT_DIR keeps carrying the backend CA alone.
+        registryCA:
+          configMap: CHANGEME-artifactory-ca-bundle
+          key: ca-bundle.crt
+          mountPath: /openbao/tls/registry
+
+        fetch:
+          enabled: true
+          url: CHANGEME-https://artifactory.example.com/artifactory/openbao/openbao-plugin-kms-azure_linux_amd64_v1.tar.gz
+
+          auth:
+            # The pod's own ServiceAccount. Nothing long-lived is stored: the
+            # token is projected at pod start, lives an hour, and is traded for
+            # an Artifactory access token that is used once.
+            method: serviceAccount
+            serviceAccount:
+              # MUST equal the audience configured on the Artifactory OIDC
+              # provider. The auto-mounted token's default API-server audience
+              # will not be accepted, which is why a token is projected here
+              # with an audience of its own.
+              audience: CHANGEME-artifactory
+              expirationSeconds: 3600
+              mountPath: /var/run/secrets/artifactory
+              tokenUrl: CHANGEME-https://artifactory.example.com/access/api/v1/oidc/token
+              # The identity mapping on this provider is what grants read on
+              # the generic repo. Bind it to
+              #   sub = system:serviceaccount:<namespace>:<serviceaccount>
+              providerName: CHANGEME-k8s-openbao
+
+    # The plugin directory must be a real, writable, non-symlink directory.
+    # An emptyDir is enough — the binary is re-fetched or re-extracted on every
+    # start, and sha256sum is verified each time.
+    volumes:
+      - name: tls-internal
+        secret: { secretName: openbao-tls-internal, defaultMode: 0400 }
+      - name: tls-server
+        secret: { secretName: openbao-tls-server, defaultMode: 0400 }
+      # init-keys is deliberately NOT mounted: bootstrap.keyOutput.mountIntoServer
+      # defaults to false so the keys are not readable by anyone who can exec
+      # into a pod. Add it back together with that flag if you want the
+      # extract-from-the-pod flow.
+      - name: plugins
+        emptyDir: {}
+      # The registry's CA. A ConfigMap volume presents each key as a symlink
+      # into ..data/, which Go follows, so SSL_CERT_DIR reads it correctly.
+      - name: registry-ca
+        configMap:
+          name: CHANGEME-artifactory-ca-bundle
+      # The pod's ServiceAccount token, minted for Artifactory's audience.
+      # Projected rather than reusing the auto-mounted token, whose audience is
+      # the API server's and which Artifactory will not accept. The kubelet
+      # rotates it; the fetch container reads it once, at pod start.
+      - name: artifactory-token
+        projected:
+          sources:
+            - serviceAccountToken:
+                path: token
+                audience: CHANGEME-artifactory
+                expirationSeconds: 3600
+      # Writable scratch for the fetch initContainer, which runs with
+      # readOnlyRootFilesystem.
+      - name: tmp
+        emptyDir: {}
+    volumeMounts:
+      - { name: tls-internal, mountPath: /openbao/tls/internal, readOnly: true }
+      - { name: tls-server,   mountPath: /openbao/tls/server,   readOnly: true }
+      - { name: plugins,      mountPath: /openbao/plugins }
+
+    # Only the backend CA. Artifactory's CA is not here: on the preloaded path
+    # OpenBao never talks to Artifactory, curl does, and it gets the bundle
+    # through CURL_CA_BUNDLE in the fetch container instead.
+    #
+    # SSL_CERT_DIR REPLACES Go's default certificate directories rather than
+    # extending them, so if you ever add an entry keep this one: dropping it
+    # breaks the http audit device, which stops OpenBao serving requests.
+    # Public roots are unaffected — they come from a default bundle FILE that
+    # SSL_CERT_DIR does not touch.
+    extraEnvironmentVars:
+      SSL_CERT_DIR: /openbao/tls/internal
+
+    # ----------------------------------------------------------------------
+    # The fetch step.
+    #
+    # The subchart renders extraInitContainers with `tpl`, so the script reads
+    # .Values.server.seal.* directly and cannot drift from the seal config
+    # above — every CHANGEME lives in those values, not in here.
+    #
+    # Note where the templating can and cannot go: this is a values FILE, so it
+    # must parse as YAML BEFORE tpl ever runs. Conditionals therefore live only
+    # inside the `args` block scalar, which is a string. The env entries and
+    # volumeMounts are structural, so they are literal and the render checks
+    # them against fetch.auth.method instead.
+    # ----------------------------------------------------------------------
+    extraInitContainers:
+      - name: fetch-seal-plugin
+        image: '{{ .Values.server.seal.plugin.fetch.image }}'
+        imagePullPolicy: '{{ .Values.server.seal.plugin.fetch.imagePullPolicy }}'
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: { drop: ["ALL"] }
+        resources:
+          requests: { cpu: 50m, memory: 64Mi }
+          limits:   { cpu: 500m, memory: 128Mi }
+        env:
+          # curl's own trust store. Keeps Artifactory's CA out of OpenBao's
+          # roots entirely, and off the command line.
+          - name: CURL_CA_BUNDLE
+            value: '{{ .Values.server.seal.plugin.registryCA.mountPath }}/{{ .Values.server.seal.plugin.registryCA.key }}'
+          # curlimages/curl runs with a read-only root; give it a writable HOME.
+          - name: HOME
+            value: /tmp
+          # With fetch.auth.method: bearerSecret, add instead:
+          # - name: ARTIFACTORY_TOKEN
+          #   valueFrom:
+          #     secretKeyRef: { name: artifactory-creds, key: token }
+        command: ["/bin/sh", "-eu", "-c"]
+        args:
+          - |
+            {{- $p := .Values.server.seal.plugin }}
+            {{- $a := $p.fetch.auth }}
+            URL="{{ $p.fetch.url }}"
+            WANT="{{ $p.sha256sum }}"
+            # ARCHIVE_BIN is the name in the tarball and in the checksum line;
+            # BIN is what OpenBao will look for. They differ upstream.
+            ARCHIVE_BIN="{{ $p.archiveBinary }}"
+            BIN="{{ $p.command | default $p.binaryName }}"
+            DIR="{{ .Values.server.seal.directory }}"
+
+            cd /tmp
+            umask 077
+            {{- if eq $a.method "serviceAccount" }}
+            SA_TOKEN="$(cat {{ $a.serviceAccount.mountPath }}/token)"
+            {{- if $a.serviceAccount.tokenUrl }}
+            # RFC 8693 token exchange: trade the projected Kubernetes token for
+            # an Artifactory access token. Both tokens travel through files,
+            # never argv, so neither is visible in `ps`.
+            cat > exchange.json <<EOF
+            {"grant_type":"urn:ietf:params:oauth:grant-type:token-exchange",
+             "subject_token_type":"urn:ietf:params:oauth:token-type:id_token",
+             "subject_token":"${SA_TOKEN}",
+             "provider_name":"{{ $a.serviceAccount.providerName }}"}
+            EOF
+            curl -fsS -X POST -H 'Content-Type: application/json' \
+                 -d @exchange.json -o exchange-out.json \
+                 '{{ $a.serviceAccount.tokenUrl }}'
+            rm -f exchange.json
+            TOKEN="$(sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' exchange-out.json)"
+            rm -f exchange-out.json
+            # An identity mapping that matches nothing still answers 200, so an
+            # empty access_token is the failure to catch here, not the HTTP code.
+            [ -n "$TOKEN" ] || { echo "OIDC token exchange returned no access_token" >&2; exit 1; }
+            {{- else }}
+            # No exchange configured: present the projected token directly.
+            TOKEN="$SA_TOKEN"
+            {{- end }}
+            {{- else if eq $a.method "bearerSecret" }}
+            TOKEN="$ARTIFACTORY_TOKEN"
+            {{- end }}
+            {{- if ne $a.method "none" }}
+            # -H would put the token in argv; a curl config file does not.
+            printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > curlrc
+            curl -fsSL -K curlrc -o plugin.tar.gz "$URL"
+            rm -f curlrc
+            {{- else }}
+            curl -fsSL -o plugin.tar.gz "$URL"
+            {{- end }}
+
+            tar xzf plugin.tar.gz
+
+            # Verify BEFORE installing. OpenBao checks this too, but failing
+            # here names the problem instead of surfacing it as a seal error.
+            echo "${WANT}  ${ARCHIVE_BIN}" | sha256sum -c - || {
+              echo "checksum mismatch: refusing to install the seal plugin" >&2
+              exit 1
+            }
+
+            install -m 0755 "$ARCHIVE_BIN" "${DIR}/${BIN}"
+            echo "installed ${DIR}/${BIN}"
+        volumeMounts:
+          - { name: plugins, mountPath: /openbao/plugins }
+          - { name: tmp,     mountPath: /tmp }
+          - { name: registry-ca, mountPath: /openbao/tls/registry, readOnly: true }
+          # Only with fetch.auth.method: serviceAccount.
+          - { name: artifactory-token, mountPath: /var/run/secrets/artifactory, readOnly: true }

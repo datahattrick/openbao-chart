@@ -1,0 +1,15 @@
+# Rendered output / local scratch
+*.rendered.yaml
+/tmp/
+.scratch/
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# NOTE: charts/*/charts/*.tgz is deliberately NOT ignored. The openbao
+# subchart is vendored, with Chart.lock committed, so that rendering never
+# needs to reach a Helm repository — see docs/AIRGAP.md.

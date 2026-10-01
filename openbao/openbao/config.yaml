@@ -1,0 +1,10 @@
+# Consumed by the homelab-gitops ApplicationSet (git files generator over
+# charts/*/config.yaml). Harmless elsewhere.
+name: openbao
+# LOAD-BEARING. Every subchart resource name derives from the release name, and
+# the TLS/init Secret names in values.yaml are literals matching it. Renaming
+# this fails the render rather than deploying something that cannot connect.
+releaseName: openbao
+namespace: openbao
+# After cert-manager/pki (which own grom-ca) and after platform.
+syncWave: "30"

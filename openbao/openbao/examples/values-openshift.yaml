@@ -1,0 +1,52 @@
+# OpenShift overlay. Layer LAST — it turns the Ingress off and the Route on:
+#   helm upgrade --install openbao openbao/ -n openbao \
+#     -f openbao/examples/values-prod.yaml \
+#     -f openbao/examples/values-openshift.yaml
+#
+# What differs on OpenShift:
+#   - The SCC assigns uid/gid/fsGroup, so no pod may pin them. That is the one
+#     line below; it is a Helm global, so it reaches this chart's own workloads
+#     AND the subchart, however deeply either is nested. Do NOT try to clear the
+#     ids with `securityContext: {pod: {}, container: {}}` instead — Helm
+#     coalesces maps key by key, so an empty map clears nothing.
+#   - Routes, not Ingress.
+#   - A project admin cannot write cluster-scoped RBAC, and the kubernetes auth
+#     method needs a ClusterRoleBinding. See the block at the bottom.
+#
+# The UBI image and the HTTP readiness probe are NOT here: they are the chart
+# default on both platforms, so `global.openshift` is the only thing that has
+# to change to move between them.
+
+# Top level, not under `openbao:` — that is the spelling Helm propagates.
+global:
+  openshift: true
+
+# The OpenShift router terminates instead of an Ingress controller.
+ingress:
+  enabled: false
+route:
+  enabled: true
+  # passthrough is the chart default: OpenBao terminates, so the router needs
+  # neither a certificate nor destinationCACertificate. Switch to reencrypt if
+  # the router has to see the traffic, and paste the frontend CA there.
+  termination: passthrough
+  insecureEdgeTerminationPolicy: Redirect
+
+# Pod Security labels are ignored here; SCCs do the work.
+namespace:
+  create: false
+
+# The kubernetes auth method verifies every login by POSTing a TokenReview to
+# the API server, which requires system:auth-delegator on the OpenBao server
+# ServiceAccount. That is a ClusterRoleBinding — cluster-scoped, and out of
+# reach of a project admin, which is how most OpenShift installs are done.
+#
+# Uncomment if you are installing as a project admin. The chart then creates no
+# binding and does not fail; `helm install` prints the manifest for a cluster
+# admin to apply, and every login is refused with a 403 until they do. Re-run
+# the bootstrap afterwards to finish configuring the mount.
+#
+# bootstrap:
+#   kubernetesAuth:
+#     rbac:
+#       create: false
